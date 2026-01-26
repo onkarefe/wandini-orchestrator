@@ -1,98 +1,139 @@
 import express from 'express';
-import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import https from 'https';
+import archiver from 'archiver';
 
 const app = express();
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '20mb' }));
 
-const ARTIFACT_DIR = '/tmp/wandini';
-fs.mkdirSync(ARTIFACT_DIR, { recursive: true });
+const PORT = process.env.PORT || 10000;
+const BASE_DIR = '/tmp/wandini';
 
-function verifyShopifyHmac(req, secret) {
-  const hmac = req.get('X-Shopify-Hmac-Sha256');
-  if (!hmac) return false;
+// klasör garanti
+fs.mkdirSync(BASE_DIR, { recursive: true });
 
-  const digest = crypto
-    .createHmac('sha256', secret)
-    .update(JSON.stringify(req.body), 'utf8')
-    .digest('base64');
-
-  return crypto.timingSafeEqual(Buffer.from(hmac), Buffer.from(digest));
-}
-
+/**
+ * Google Cloud Storage'dan dosya indirir
+ */
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest);
-    https.get(url, (res) => {
-      res.pipe(file);
-      file.on('finish', () => file.close(resolve));
-    }).on('error', reject);
+
+    https
+      .get(url, (res) => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`Download failed: ${res.statusCode}`));
+          return;
+        }
+
+        res.pipe(file);
+        file.on('finish', () => file.close(resolve));
+      })
+      .on('error', reject);
   });
 }
 
+/**
+ * Shopify order -> XML
+ */
 function orderToXML(order, masterAssetId) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Order>
   <OrderId>${order.id}</OrderId>
-  <MasterAssetId>${masterAssetId}</MasterAssetId>
-  <Email>${order.email}</Email>
-  <TotalPrice>${order.total_price}</TotalPrice>
+  <Email>${order.email || ''}</Email>
   <Currency>${order.currency}</Currency>
+  <TotalPrice>${order.total_price}</TotalPrice>
+  <MasterAssetId>${masterAssetId}</MasterAssetId>
   <RawPayload><![CDATA[${JSON.stringify(order)}]]></RawPayload>
 </Order>`;
 }
 
+/**
+ * WEBHOOK — orders/paid
+ * HMAC KAPALI (Hookdeck arkasındayız)
+ */
 app.post('/webhooks/orders-paid', async (req, res) => {
-  // TEMP: HMAC disabled behind Hookdeck
-// if (!verifyShopifyHmac(req, process.env.SHOPIFY_WEBHOOK_SECRET)) {
-//   return res.status(401).send('Invalid HMAC');
-// }
+  try {
+    const order = req.body;
+    const orderId = order.id;
 
+    if (!orderId) {
+      return res.status(400).send('order.id missing');
+    }
 
-  const order = req.body;
-  const orderId = order.id;
+    // master_asset_id extract
+    let masterAssetId = null;
 
-  let masterAssetId = null;
-  for (const item of order.line_items || []) {
-    for (const p of item.properties || []) {
-      if (p.name === 'configurator_payload') {
-        const cfg = JSON.parse(p.value);
-        masterAssetId = cfg.master_asset_id;
+    for (const item of order.line_items || []) {
+      for (const p of item.properties || []) {
+        if (p.name === 'configurator_payload') {
+          const cfg = JSON.parse(p.value);
+          masterAssetId = cfg.master_asset_id;
+        }
       }
     }
+
+    if (!masterAssetId) {
+      return res.status(400).send('master_asset_id missing');
+    }
+
+    const orderDir = path.join(BASE_DIR, String(orderId));
+    fs.mkdirSync(orderDir, { recursive: true });
+
+    const masterUrl = `https://storage.googleapis.com/wandini-masters/${masterAssetId}/master.png`;
+    const masterPath = path.join(orderDir, 'master.png');
+    const xmlPath = path.join(orderDir, 'order.xml');
+
+    await downloadFile(masterUrl, masterPath);
+    fs.writeFileSync(xmlPath, orderToXML(order, masterAssetId));
+
+    console.log('ARTIFACTS READY:', {
+      orderId,
+      masterPath,
+      xmlPath,
+    });
+
+    res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error('WEBHOOK ERROR:', err);
+    res.status(500).send('internal error');
   }
-
-  if (!masterAssetId) {
-    return res.status(400).send('master_asset_id missing');
-  }
-
-  const masterUrl = `https://storage.googleapis.com/wandini-masters/${masterAssetId}/master.png`;
-
-  const orderDir = path.join(ARTIFACT_DIR, String(orderId));
-  fs.mkdirSync(orderDir, { recursive: true });
-
-  const masterPath = path.join(orderDir, 'master.png');
-  const xmlPath = path.join(orderDir, 'order.xml');
-
-  await downloadFile(masterUrl, masterPath);
-  fs.writeFileSync(xmlPath, orderToXML(order, masterAssetId));
-
-  console.log('ARTIFACTS READY:', {
-    orderId,
-    masterPath,
-    xmlPath
-  });
-
-  res.status(200).json({ ok: true });
 });
 
+/**
+ * DOWNLOAD — ZIP
+ */
+app.get('/download/:orderId', (req, res) => {
+  const { orderId } = req.params;
+  const dir = path.join(BASE_DIR, orderId);
+
+  if (!fs.existsSync(dir)) {
+    return res.status(404).send('Order artifacts not found');
+  }
+
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader(
+    'Content-Disposition',
+    `attachment; filename=wandini-${orderId}.zip`
+  );
+
+  const archive = archiver('zip', { zlib: { level: 9 } });
+  archive.pipe(res);
+
+  archive.file(path.join(dir, 'master.png'), { name: 'master.png' });
+  archive.file(path.join(dir, 'order.xml'), { name: 'order.xml' });
+
+  archive.finalize();
+});
+
+/**
+ * HEALTH
+ */
 app.get('/', (_req, res) => {
   res.send('wandini orchestrator alive');
 });
 
-const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Orchestrator listening on port ${PORT}`);
 });
