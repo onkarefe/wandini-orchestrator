@@ -1,104 +1,96 @@
 import express from 'express';
-import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import https from 'https';
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-/**
- * Shopify HMAC doğrulama
- */
+const ARTIFACT_DIR = '/tmp/wandini';
+fs.mkdirSync(ARTIFACT_DIR, { recursive: true });
+
 function verifyShopifyHmac(req, secret) {
   const hmac = req.get('X-Shopify-Hmac-Sha256');
-  const body = JSON.stringify(req.body);
+  if (!hmac) return false;
 
   const digest = crypto
     .createHmac('sha256', secret)
-    .update(body, 'utf8')
+    .update(JSON.stringify(req.body), 'utf8')
     .digest('base64');
 
-  if (!hmac) return false;
-
-  return crypto.timingSafeEqual(
-    Buffer.from(hmac),
-    Buffer.from(digest)
-  );
+  return crypto.timingSafeEqual(Buffer.from(hmac), Buffer.from(digest));
 }
 
-/**
- * Basit idempotency (ilk faz)
- */
-const processedOrders = new Set();
+function downloadFile(url, dest) {
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(dest);
+    https.get(url, (res) => {
+      res.pipe(file);
+      file.on('finish', () => file.close(resolve));
+    }).on('error', reject);
+  });
+}
 
-/**
- * Webhook endpoint
- */
-app.post('/webhooks/orders-paid', (req, res) => {
-  // 🔐 HMAC doğrulama
+function orderToXML(order, masterAssetId) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Order>
+  <OrderId>${order.id}</OrderId>
+  <MasterAssetId>${masterAssetId}</MasterAssetId>
+  <Email>${order.email}</Email>
+  <TotalPrice>${order.total_price}</TotalPrice>
+  <Currency>${order.currency}</Currency>
+  <RawPayload><![CDATA[${JSON.stringify(order)}]]></RawPayload>
+</Order>`;
+}
+
+app.post('/webhooks/orders-paid', async (req, res) => {
   if (!verifyShopifyHmac(req, process.env.SHOPIFY_WEBHOOK_SECRET)) {
-    console.error('Invalid HMAC');
     return res.status(401).send('Invalid HMAC');
   }
 
-  // 🔁 Idempotency
-  const orderId = req.body?.id;
-  if (processedOrders.has(orderId)) {
-    console.log('Duplicate order received:', orderId);
-    return res.status(200).json({ ok: true, duplicate: true });
-  }
-  processedOrders.add(orderId);
+  const order = req.body;
+  const orderId = order.id;
 
-  try {
-    const order = req.body;
-
-    // 🔍 Configurator payload'u bul
-    const lineItems = order?.line_items || [];
-    let config = null;
-
-    for (const item of lineItems) {
-      const props = item.properties || [];
-      for (const p of props) {
-        if (p.name === 'configurator_payload') {
-          config = JSON.parse(p.value);
-        }
+  let masterAssetId = null;
+  for (const item of order.line_items || []) {
+    for (const p of item.properties || []) {
+      if (p.name === 'configurator_payload') {
+        const cfg = JSON.parse(p.value);
+        masterAssetId = cfg.master_asset_id;
       }
     }
-
-    if (!config) {
-      console.error('Configurator payload not found');
-      return res.status(400).json({ error: 'configurator_payload missing' });
-    }
-
-    // 🧠 Normalized job
-    const job = {
-      job_id: uuidv4(),
-      master_asset_id: config.master_asset_id,
-      master_url: `https://storage.googleapis.com/wandini-masters/${config.master_asset_id}/master.png`,
-      output_mm: {
-        w: config.output.width,
-        h: config.output.height
-      },
-      crop: config.crop_ratio,
-      status: 'RECEIVED'
-    };
-
-    console.log('JOB RECEIVED:\n', JSON.stringify(job, null, 2));
-
-    return res.status(200).json({ ok: true });
-  } catch (err) {
-    console.error('Webhook processing error:', err);
-    return res.status(500).json({ error: 'internal error' });
   }
+
+  if (!masterAssetId) {
+    return res.status(400).send('master_asset_id missing');
+  }
+
+  const masterUrl = `https://storage.googleapis.com/wandini-masters/${masterAssetId}/master.png`;
+
+  const orderDir = path.join(ARTIFACT_DIR, String(orderId));
+  fs.mkdirSync(orderDir, { recursive: true });
+
+  const masterPath = path.join(orderDir, 'master.png');
+  const xmlPath = path.join(orderDir, 'order.xml');
+
+  await downloadFile(masterUrl, masterPath);
+  fs.writeFileSync(xmlPath, orderToXML(order, masterAssetId));
+
+  console.log('ARTIFACTS READY:', {
+    orderId,
+    masterPath,
+    xmlPath
+  });
+
+  res.status(200).json({ ok: true });
 });
 
-/**
- * Health check
- */
 app.get('/', (_req, res) => {
   res.send('wandini orchestrator alive');
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`Orchestrator listening on port ${PORT}`);
 });
