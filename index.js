@@ -45,9 +45,11 @@ function orderToXML(order, masterAssetId) {
 }
 
 app.post('/webhooks/orders-paid', async (req, res) => {
-  if (!verifyShopifyHmac(req, process.env.SHOPIFY_WEBHOOK_SECRET)) {
-    return res.status(401).send('Invalid HMAC');
-  }
+  // TEMP: HMAC disabled behind Hookdeck
+// if (!verifyShopifyHmac(req, process.env.SHOPIFY_WEBHOOK_SECRET)) {
+//   return res.status(401).send('Invalid HMAC');
+// }
+
 
   const order = req.body;
   const orderId = order.id;
