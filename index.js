@@ -5,6 +5,14 @@ import https from 'https';
 import archiver from 'archiver';
 import sharp from 'sharp';
 
+/**
+ * SHARP / LIBVIPS AYARLARI
+ * Büyük master görseller için ZORUNLU
+ */
+sharp.cache(false);
+sharp.concurrency(1);
+sharp.limitInputPixels(false);
+
 const app = express();
 app.use(express.json({ limit: '20mb' }));
 
@@ -46,6 +54,9 @@ function orderToXML(order, masterAssetId) {
 </Order>`;
 }
 
+/**
+ * WEBHOOK — orders/paid
+ */
 app.post('/webhooks/orders-paid', async (req, res) => {
   try {
     const order = req.body;
@@ -87,10 +98,10 @@ app.post('/webhooks/orders-paid', async (req, res) => {
 
     const t0 = Date.now();
 
-    const image = sharp(masterPath);
-    const meta = await image.metadata();
-
     log(orderId, 'Sharp started');
+
+    const image = sharp(masterPath, { sequentialRead: true });
+    const meta = await image.metadata();
 
     const crop = {
       left: Math.round(meta.width * cropRatio.x),
@@ -107,7 +118,6 @@ app.post('/webhooks/orders-paid', async (req, res) => {
     log(orderId, `Crop completed (${Date.now() - t0} ms)`);
 
     const downloadUrl = `/download/${orderId}`;
-
     log(orderId, `ZIP ready: ${downloadUrl}`);
 
     res.status(200).json({
@@ -120,6 +130,10 @@ app.post('/webhooks/orders-paid', async (req, res) => {
   }
 });
 
+/**
+ * DOWNLOAD — ZIP
+ * SADECE: order.xml + cropped.png
+ */
 app.get('/download/:orderId', (req, res) => {
   const { orderId } = req.params;
   const dir = path.join(BASE_DIR, orderId);
@@ -143,6 +157,9 @@ app.get('/download/:orderId', (req, res) => {
   archive.finalize();
 });
 
+/**
+ * HEALTH
+ */
 app.get('/', (_req, res) => {
   res.send('wandini orchestrator alive');
 });
