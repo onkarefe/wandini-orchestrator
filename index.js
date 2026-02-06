@@ -17,6 +17,9 @@ app.use(express.json({ limit: '20mb' }));
 const PORT = process.env.PORT || 10000;
 const BASE_DIR = '/tmp/wandini';
 
+// ORDER-LEVEL LOCK (TEST İÇİN)
+const processingOrders = new Set();
+
 fs.mkdirSync(BASE_DIR, { recursive: true });
 
 function log(orderId, msg) {
@@ -53,12 +56,20 @@ function orderToXML(order, masterAssetId) {
 }
 
 app.post('/webhooks/orders-paid', async (req, res) => {
+  const order = req.body;
+  const orderId = order.id;
+
+  if (!orderId) return res.status(400).send('order.id missing');
+
+  // 🔒 DUPLICATE WEBHOOK KORUMASI
+  if (processingOrders.has(orderId)) {
+    log(orderId, 'Duplicate webhook ignored (already processing)');
+    return res.status(200).send('ok');
+  }
+
+  processingOrders.add(orderId);
+
   try {
-    const order = req.body;
-    const orderId = order.id;
-
-    if (!orderId) return res.status(400).send('order.id missing');
-
     let masterAssetId = null;
     let cropRatio = null;
 
@@ -122,6 +133,8 @@ app.post('/webhooks/orders-paid', async (req, res) => {
   } catch (err) {
     console.error('WEBHOOK ERROR:', err);
     res.status(500).send('internal error');
+  } finally {
+    processingOrders.delete(orderId);
   }
 });
 
