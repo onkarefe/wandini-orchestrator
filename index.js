@@ -17,10 +17,14 @@ app.use(express.json({ limit: '20mb' }));
 const PORT = process.env.PORT || 10000;
 const BASE_DIR = '/tmp/wandini';
 
-// ORDER-LEVEL LOCK (TEST İÇİN)
-const processingOrders = new Set();
-
 fs.mkdirSync(BASE_DIR, { recursive: true });
+
+/**
+ * SIMPLE IN-MEMORY QUEUE
+ */
+let isProcessing = false;
+const queue = [];
+const doneOrders = new Set();
 
 function log(orderId, msg) {
   console.log(`[${orderId}] ${msg}`);
@@ -55,21 +59,16 @@ function orderToXML(order, masterAssetId) {
 </Order>`;
 }
 
-app.post('/webhooks/orders-paid', async (req, res) => {
-  const order = req.body;
+/**
+ * CORE WORKER
+ */
+async function processOrder(order) {
   const orderId = order.id;
-
-  if (!orderId) return res.status(400).send('order.id missing');
-
-  // 🔒 DUPLICATE WEBHOOK KORUMASI
-  if (processingOrders.has(orderId)) {
-    log(orderId, 'Duplicate webhook ignored (already processing)');
-    return res.status(200).send('ok');
-  }
-
-  processingOrders.add(orderId);
+  isProcessing = true;
 
   try {
+    log(orderId, 'Processing started');
+
     let masterAssetId = null;
     let cropRatio = null;
 
@@ -83,8 +82,10 @@ app.post('/webhooks/orders-paid', async (req, res) => {
       }
     }
 
-    if (!masterAssetId) return res.status(400).send('master_asset_id missing');
-    if (!cropRatio) return res.status(400).send('crop_ratio missing');
+    if (!masterAssetId || !cropRatio) {
+      log(orderId, 'Missing configurator data, skipping');
+      return;
+    }
 
     const orderDir = path.join(BASE_DIR, String(orderId));
     fs.mkdirSync(orderDir, { recursive: true });
@@ -93,8 +94,6 @@ app.post('/webhooks/orders-paid', async (req, res) => {
     const masterPath = path.join(orderDir, 'master.png');
     const croppedPath = path.join(orderDir, 'cropped.png');
     const xmlPath = path.join(orderDir, 'order.xml');
-
-    log(orderId, 'Webhook received');
 
     await downloadFile(masterUrl, masterPath);
     log(orderId, 'Master file downloaded');
@@ -126,18 +125,48 @@ app.post('/webhooks/orders-paid', async (req, res) => {
 
     log(orderId, `Crop completed (${Date.now() - t0} ms)`);
 
-    const downloadUrl = `/download/${orderId}`;
-    log(orderId, `ZIP ready: ${downloadUrl}`);
-
-    res.status(200).json({ ok: true, download: downloadUrl });
+    log(orderId, `ZIP ready: /download/${orderId}`);
+    doneOrders.add(orderId);
   } catch (err) {
-    console.error('WEBHOOK ERROR:', err);
-    res.status(500).send('internal error');
+    console.error(`[${orderId}] PROCESS ERROR:`, err);
   } finally {
-    processingOrders.delete(orderId);
+    isProcessing = false;
+
+    if (queue.length > 0) {
+      const next = queue.shift();
+      processOrder(next);
+    }
   }
+}
+
+/**
+ * WEBHOOK
+ */
+app.post('/webhooks/orders-paid', (req, res) => {
+  const order = req.body;
+  const orderId = order.id;
+
+  if (!orderId) return res.status(400).send('order.id missing');
+
+  if (doneOrders.has(orderId)) {
+    log(orderId, 'Already done, skipping');
+    return res.status(200).send('ok');
+  }
+
+  if (isProcessing) {
+    log(orderId, 'Queued (worker busy)');
+    queue.push(order);
+    return res.status(200).send('queued');
+  }
+
+  log(orderId, 'Accepted for processing');
+  processOrder(order);
+  res.status(200).send('processing');
 });
 
+/**
+ * DOWNLOAD ZIP
+ */
 app.get('/download/:orderId', (req, res) => {
   const { orderId } = req.params;
   const dir = path.join(BASE_DIR, orderId);
@@ -161,6 +190,9 @@ app.get('/download/:orderId', (req, res) => {
   archive.finalize();
 });
 
+/**
+ * HEALTH
+ */
 app.get('/', (_req, res) => {
   res.send('wandini orchestrator alive');
 });
