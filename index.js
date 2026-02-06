@@ -6,12 +6,10 @@ import archiver from 'archiver';
 import sharp from 'sharp';
 
 /**
- * SHARP / LIBVIPS AYARLARI
- * Büyük master görseller için ZORUNLU
+ * SHARP GLOBAL AYARLAR
  */
 sharp.cache(false);
 sharp.concurrency(1);
-sharp.limitInputPixels(false);
 
 const app = express();
 app.use(express.json({ limit: '20mb' }));
@@ -54,9 +52,6 @@ function orderToXML(order, masterAssetId) {
 </Order>`;
 }
 
-/**
- * WEBHOOK — orders/paid
- */
 app.post('/webhooks/orders-paid', async (req, res) => {
   try {
     const order = req.body;
@@ -96,11 +91,14 @@ app.post('/webhooks/orders-paid', async (req, res) => {
     fs.writeFileSync(xmlPath, orderToXML(order, masterAssetId));
     log(orderId, 'XML created');
 
+    log(orderId, 'Sharp started');
     const t0 = Date.now();
 
-    log(orderId, 'Sharp started');
+    const image = sharp(masterPath, {
+      sequentialRead: true,
+      limitInputPixels: false,
+    });
 
-    const image = sharp(masterPath, { sequentialRead: true });
     const meta = await image.metadata();
 
     const crop = {
@@ -120,20 +118,13 @@ app.post('/webhooks/orders-paid', async (req, res) => {
     const downloadUrl = `/download/${orderId}`;
     log(orderId, `ZIP ready: ${downloadUrl}`);
 
-    res.status(200).json({
-      ok: true,
-      download: downloadUrl,
-    });
+    res.status(200).json({ ok: true, download: downloadUrl });
   } catch (err) {
     console.error('WEBHOOK ERROR:', err);
     res.status(500).send('internal error');
   }
 });
 
-/**
- * DOWNLOAD — ZIP
- * SADECE: order.xml + cropped.png
- */
 app.get('/download/:orderId', (req, res) => {
   const { orderId } = req.params;
   const dir = path.join(BASE_DIR, orderId);
@@ -157,9 +148,6 @@ app.get('/download/:orderId', (req, res) => {
   archive.finalize();
 });
 
-/**
- * HEALTH
- */
 app.get('/', (_req, res) => {
   res.send('wandini orchestrator alive');
 });
