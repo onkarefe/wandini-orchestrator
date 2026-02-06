@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import https from 'https';
 import archiver from 'archiver';
+import sharp from 'sharp';
 
 const app = express();
 app.use(express.json({ limit: '20mb' }));
@@ -10,12 +11,12 @@ app.use(express.json({ limit: '20mb' }));
 const PORT = process.env.PORT || 10000;
 const BASE_DIR = '/tmp/wandini';
 
-// klasör garanti
 fs.mkdirSync(BASE_DIR, { recursive: true });
 
-/**
- * Google Cloud Storage'dan dosya indirir
- */
+function log(orderId, msg) {
+  console.log(`[${orderId}] ${msg}`);
+}
+
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest);
@@ -26,7 +27,6 @@ function downloadFile(url, dest) {
           reject(new Error(`Download failed: ${res.statusCode}`));
           return;
         }
-
         res.pipe(file);
         file.on('finish', () => file.close(resolve));
       })
@@ -34,9 +34,6 @@ function downloadFile(url, dest) {
   });
 }
 
-/**
- * Shopify order -> XML
- */
 function orderToXML(order, masterAssetId) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Order>
@@ -49,61 +46,80 @@ function orderToXML(order, masterAssetId) {
 </Order>`;
 }
 
-/**
- * WEBHOOK — orders/paid
- * HMAC KAPALI (Hookdeck arkasındayız)
- */
 app.post('/webhooks/orders-paid', async (req, res) => {
   try {
     const order = req.body;
     const orderId = order.id;
 
-    if (!orderId) {
-      return res.status(400).send('order.id missing');
-    }
+    if (!orderId) return res.status(400).send('order.id missing');
 
-    // master_asset_id extract
     let masterAssetId = null;
+    let cropRatio = null;
 
     for (const item of order.line_items || []) {
       for (const p of item.properties || []) {
         if (p.name === 'configurator_payload') {
           const cfg = JSON.parse(p.value);
           masterAssetId = cfg.master_asset_id;
+          cropRatio = cfg.crop_ratio;
         }
       }
     }
 
-    if (!masterAssetId) {
-      return res.status(400).send('master_asset_id missing');
-    }
+    if (!masterAssetId) return res.status(400).send('master_asset_id missing');
+    if (!cropRatio) return res.status(400).send('crop_ratio missing');
 
     const orderDir = path.join(BASE_DIR, String(orderId));
     fs.mkdirSync(orderDir, { recursive: true });
 
     const masterUrl = `https://storage.googleapis.com/wandini-masters/${masterAssetId}/master.png`;
     const masterPath = path.join(orderDir, 'master.png');
+    const croppedPath = path.join(orderDir, 'cropped.png');
     const xmlPath = path.join(orderDir, 'order.xml');
 
+    log(orderId, 'Webhook received');
+
     await downloadFile(masterUrl, masterPath);
+    log(orderId, 'Master file downloaded');
+
     fs.writeFileSync(xmlPath, orderToXML(order, masterAssetId));
+    log(orderId, 'XML created');
 
-    console.log('ARTIFACTS READY:', {
-      orderId,
-      masterPath,
-      xmlPath,
+    const t0 = Date.now();
+
+    const image = sharp(masterPath);
+    const meta = await image.metadata();
+
+    log(orderId, 'Sharp started');
+
+    const crop = {
+      left: Math.round(meta.width * cropRatio.x),
+      top: Math.round(meta.height * cropRatio.y),
+      width: Math.round(meta.width * cropRatio.w),
+      height: Math.round(meta.height * cropRatio.h),
+    };
+
+    await image
+      .extract(crop)
+      .png({ compressionLevel: 0 })
+      .toFile(croppedPath);
+
+    log(orderId, `Crop completed (${Date.now() - t0} ms)`);
+
+    const downloadUrl = `/download/${orderId}`;
+
+    log(orderId, `ZIP ready: ${downloadUrl}`);
+
+    res.status(200).json({
+      ok: true,
+      download: downloadUrl,
     });
-
-    res.status(200).json({ ok: true });
   } catch (err) {
     console.error('WEBHOOK ERROR:', err);
     res.status(500).send('internal error');
   }
 });
 
-/**
- * DOWNLOAD — ZIP
- */
 app.get('/download/:orderId', (req, res) => {
   const { orderId } = req.params;
   const dir = path.join(BASE_DIR, orderId);
@@ -121,15 +137,12 @@ app.get('/download/:orderId', (req, res) => {
   const archive = archiver('zip', { zlib: { level: 9 } });
   archive.pipe(res);
 
-  archive.file(path.join(dir, 'master.png'), { name: 'master.png' });
   archive.file(path.join(dir, 'order.xml'), { name: 'order.xml' });
+  archive.file(path.join(dir, 'cropped.png'), { name: 'cropped.png' });
 
   archive.finalize();
 });
 
-/**
- * HEALTH
- */
 app.get('/', (_req, res) => {
   res.send('wandini orchestrator alive');
 });
