@@ -1,9 +1,9 @@
-import express from 'express';
-import fs from 'fs';
-import path from 'path';
-import https from 'https';
-import archiver from 'archiver';
-import sharp from 'sharp';
+import express from "express";
+import fs from "fs";
+import path from "path";
+import https from "https";
+import archiver from "archiver";
+import sharp from "sharp";
 
 /**
  * SHARP GLOBAL AYARLAR
@@ -12,10 +12,10 @@ sharp.cache(false);
 sharp.concurrency(1);
 
 const app = express();
-app.use(express.json({ limit: '20mb' }));
+app.use(express.json({ limit: "20mb" }));
 
 const PORT = process.env.PORT || 10000;
-const BASE_DIR = '/tmp/wandini';
+const BASE_DIR = "/tmp/wandini";
 
 fs.mkdirSync(BASE_DIR, { recursive: true });
 
@@ -41,22 +41,81 @@ function downloadFile(url, dest) {
           return;
         }
         res.pipe(file);
-        file.on('finish', () => file.close(resolve));
+        file.on("finish", () => file.close(resolve));
       })
-      .on('error', reject);
+      .on("error", reject);
   });
 }
 
 function orderToXML(order, masterAssetId) {
+  const orderNumber = order.id;
+
+  const shippingType = "Standard"; // MANUAL (değiştirilebilir)
+
+  const shippingFrom = order.billing_address || {};
+  const shippingTo = order.shipping_address || {};
+
+  // Configurator output width/height
+  let outputWidth = null;
+  let outputHeight = null;
+  let quantity = 1;
+
+  for (const item of order.line_items || []) {
+    quantity = item.quantity || 1;
+
+    for (const p of item.properties || []) {
+      if (p.name === "configurator_payload") {
+        const cfg = JSON.parse(p.value);
+        outputWidth = cfg.output?.width;
+        outputHeight = cfg.output?.height;
+      }
+    }
+  }
+
+  const sku = "1.14-1.3.10"; // MANUAL – factory'den gelecek
+
   return `<?xml version="1.0" encoding="UTF-8"?>
-<Order>
-  <OrderId>${order.id}</OrderId>
-  <Email>${order.email || ''}</Email>
-  <Currency>${order.currency}</Currency>
-  <TotalPrice>${order.total_price}</TotalPrice>
-  <MasterAssetId>${masterAssetId}</MasterAssetId>
-  <RawPayload><![CDATA[${JSON.stringify(order)}]]></RawPayload>
-</Order>`;
+<root>
+  <order>
+    <order_number>${orderNumber}</order_number>
+    <reference></reference>
+    <shipping_type>${shippingType}</shipping_type>
+
+    <shipping_from>
+      <company>${shippingFrom.company || shippingFrom.name || ""}</company>
+      <contact_person>${shippingFrom.name || ""}</contact_person>
+      <street>${shippingFrom.address1 || ""}</street>
+      <postcode>${shippingFrom.zip || ""}</postcode>
+      <city>${shippingFrom.city || ""}</city>
+      <country>${shippingFrom.country_code || ""}</country>
+    </shipping_from>
+
+    <shipping_to>
+      <company>${shippingTo.company || shippingTo.name || ""}</company>
+      <contact_person>${shippingTo.name || ""}</contact_person>
+      <street>${shippingTo.address1 || ""}</street>
+      <postcode>${shippingTo.zip || ""}</postcode>
+      <city>${shippingTo.city || ""}</city>
+      <country>${shippingTo.country_code || ""}</country>
+      <phone>${shippingTo.phone || ""}</phone>
+    </shipping_to>
+
+    <delivery_note type="ftp"></delivery_note>
+  </order>
+
+  <positions>
+    <position>
+      <sku>${sku}</sku>
+      <width unit="mm">${outputWidth}</width>
+      <height unit="mm">${outputHeight}</height>
+      <variants>1</variants>
+      <copies_per_variant>${quantity}</copies_per_variant>
+      <files>
+        <file type="ftp">${orderNumber}_1.pdf</file>
+      </files>
+    </position>
+  </positions>
+</root>`;
 }
 
 /**
@@ -67,14 +126,14 @@ async function processOrder(order) {
   isProcessing = true;
 
   try {
-    log(orderId, 'Processing started');
+    log(orderId, "Processing started");
 
     let masterAssetId = null;
     let cropRatio = null;
 
     for (const item of order.line_items || []) {
       for (const p of item.properties || []) {
-        if (p.name === 'configurator_payload') {
+        if (p.name === "configurator_payload") {
           const cfg = JSON.parse(p.value);
           masterAssetId = cfg.master_asset_id;
           cropRatio = cfg.crop_ratio;
@@ -83,7 +142,7 @@ async function processOrder(order) {
     }
 
     if (!masterAssetId || !cropRatio) {
-      log(orderId, 'Missing configurator data, skipping');
+      log(orderId, "Missing configurator data, skipping");
       return;
     }
 
@@ -91,17 +150,17 @@ async function processOrder(order) {
     fs.mkdirSync(orderDir, { recursive: true });
 
     const masterUrl = `https://storage.googleapis.com/wandini-masters/${masterAssetId}/master.png`;
-    const masterPath = path.join(orderDir, 'master.png');
-    const croppedPath = path.join(orderDir, 'cropped.png');
-    const xmlPath = path.join(orderDir, 'order.xml');
+    const masterPath = path.join(orderDir, "master.png");
+    const croppedPath = path.join(orderDir, "cropped.png");
+    const xmlPath = path.join(orderDir, "order.xml");
 
     await downloadFile(masterUrl, masterPath);
-    log(orderId, 'Master file downloaded');
+    log(orderId, "Master file downloaded");
 
     fs.writeFileSync(xmlPath, orderToXML(order, masterAssetId));
-    log(orderId, 'XML created');
+    log(orderId, "XML created");
 
-    log(orderId, 'Sharp started');
+    log(orderId, "Sharp started");
     const t0 = Date.now();
 
     const image = sharp(masterPath, {
@@ -118,10 +177,7 @@ async function processOrder(order) {
       height: Math.round(meta.height * cropRatio.h),
     };
 
-    await image
-      .extract(crop)
-      .png({ compressionLevel: 0 })
-      .toFile(croppedPath);
+    await image.extract(crop).png({ compressionLevel: 0 }).toFile(croppedPath);
 
     log(orderId, `Crop completed (${Date.now() - t0} ms)`);
 
@@ -142,50 +198,50 @@ async function processOrder(order) {
 /**
  * WEBHOOK
  */
-app.post('/webhooks/orders-paid', (req, res) => {
+app.post("/webhooks/orders-paid", (req, res) => {
   const order = req.body;
   const orderId = order.id;
 
-  if (!orderId) return res.status(400).send('order.id missing');
+  if (!orderId) return res.status(400).send("order.id missing");
 
   if (doneOrders.has(orderId)) {
-    log(orderId, 'Already done, skipping');
-    return res.status(200).send('ok');
+    log(orderId, "Already done, skipping");
+    return res.status(200).send("ok");
   }
 
   if (isProcessing) {
-    log(orderId, 'Queued (worker busy)');
+    log(orderId, "Queued (worker busy)");
     queue.push(order);
-    return res.status(200).send('queued');
+    return res.status(200).send("queued");
   }
 
-  log(orderId, 'Accepted for processing');
+  log(orderId, "Accepted for processing");
   processOrder(order);
-  res.status(200).send('processing');
+  res.status(200).send("processing");
 });
 
 /**
  * DOWNLOAD ZIP
  */
-app.get('/download/:orderId', (req, res) => {
+app.get("/download/:orderId", (req, res) => {
   const { orderId } = req.params;
   const dir = path.join(BASE_DIR, orderId);
 
   if (!fs.existsSync(dir)) {
-    return res.status(404).send('Order artifacts not found');
+    return res.status(404).send("Order artifacts not found");
   }
 
-  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader("Content-Type", "application/zip");
   res.setHeader(
-    'Content-Disposition',
-    `attachment; filename=wandini-${orderId}.zip`
+    "Content-Disposition",
+    `attachment; filename=wandini-${orderId}.zip`,
   );
 
-  const archive = archiver('zip', { zlib: { level: 9 } });
+  const archive = archiver("zip", { zlib: { level: 9 } });
   archive.pipe(res);
 
-  archive.file(path.join(dir, 'order.xml'), { name: 'order.xml' });
-  archive.file(path.join(dir, 'cropped.png'), { name: 'cropped.png' });
+  archive.file(path.join(dir, "order.xml"), { name: "order.xml" });
+  archive.file(path.join(dir, "cropped.png"), { name: "cropped.png" });
 
   archive.finalize();
 });
@@ -193,8 +249,8 @@ app.get('/download/:orderId', (req, res) => {
 /**
  * HEALTH
  */
-app.get('/', (_req, res) => {
-  res.send('wandini orchestrator alive');
+app.get("/", (_req, res) => {
+  res.send("wandini orchestrator alive");
 });
 
 app.listen(PORT, () => {
