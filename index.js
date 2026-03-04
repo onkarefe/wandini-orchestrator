@@ -17,6 +17,9 @@ app.use(express.json({ limit: "20mb" }));
 const PORT = process.env.PORT || 10000;
 const BASE_DIR = "/tmp/wandini";
 const MAX_PANEL_CM = 70;
+const TMP_LIMIT_BYTES = 2 * 1024 * 1024 * 1024; // Render /tmp hard limit (2GB)
+const TMP_SAFETY_BYTES = 200 * 1024 * 1024; // Leave headroom to avoid eviction
+const ARTIFACT_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
 
 fs.mkdirSync(BASE_DIR, { recursive: true });
 
@@ -37,6 +40,91 @@ function logStep(orderId, step, details = null) {
     return;
   }
   console.log(`[${orderId}] [${step}]`, details);
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes < 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let idx = 0;
+  while (value >= 1024 && idx < units.length - 1) {
+    value /= 1024;
+    idx += 1;
+  }
+  return `${value.toFixed(2)} ${units[idx]}`;
+}
+
+function getDirSizeBytes(targetPath) {
+  if (!fs.existsSync(targetPath)) return 0;
+  const stat = fs.statSync(targetPath);
+  if (stat.isFile()) return stat.size;
+  if (!stat.isDirectory()) return 0;
+  let total = 0;
+  for (const entry of fs.readdirSync(targetPath)) {
+    total += getDirSizeBytes(path.join(targetPath, entry));
+  }
+  return total;
+}
+
+function getTmpUsageBytes() {
+  if (!fs.existsSync(BASE_DIR)) return 0;
+  let total = 0;
+  for (const entry of fs.readdirSync(BASE_DIR)) {
+    total += getDirSizeBytes(path.join(BASE_DIR, entry));
+  }
+  return total;
+}
+
+function cleanupStaleArtifacts(orderId) {
+  if (!fs.existsSync(BASE_DIR)) return { removed: 0, freedBytes: 0 };
+  const now = Date.now();
+  let removed = 0;
+  let freedBytes = 0;
+  for (const entry of fs.readdirSync(BASE_DIR)) {
+    const dirPath = path.join(BASE_DIR, entry);
+    let stat;
+    try {
+      stat = fs.statSync(dirPath);
+    } catch {
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+    const ageMs = now - stat.mtimeMs;
+    if (ageMs < ARTIFACT_TTL_MS) continue;
+    const dirSize = getDirSizeBytes(dirPath);
+    try {
+      fs.rmSync(dirPath, { recursive: true, force: true });
+      removed += 1;
+      freedBytes += dirSize;
+    } catch (err) {
+      logStep(orderId, "tmp.cleanup.stale_failed", {
+        dirPath,
+        message: err?.message || String(err),
+      });
+    }
+  }
+  return { removed, freedBytes };
+}
+
+function ensureTmpBudget(orderId, estimatedNeedBytes) {
+  const usage = getTmpUsageBytes();
+  const available = Math.max(0, TMP_LIMIT_BYTES - usage);
+  const availableSafe = Math.max(0, available - TMP_SAFETY_BYTES);
+  logStep(orderId, "tmp.budget.check", {
+    usageBytes: usage,
+    usageHuman: formatBytes(usage),
+    estimatedNeedBytes,
+    estimatedNeedHuman: formatBytes(estimatedNeedBytes),
+    availableBytes: available,
+    availableHuman: formatBytes(available),
+    availableSafeBytes: availableSafe,
+    availableSafeHuman: formatBytes(availableSafe),
+  });
+  if (estimatedNeedBytes > availableSafe) {
+    throw new Error(
+      `Insufficient /tmp space: need ${formatBytes(estimatedNeedBytes)}, safe-available ${formatBytes(availableSafe)}`,
+    );
+  }
 }
 
 function parseConfiguratorPayload(order) {
@@ -178,6 +266,13 @@ async function processOrder(order) {
       queueLength: queue.length,
       lineItemCount: (order.line_items || []).length,
     });
+    const stale = cleanupStaleArtifacts(orderId);
+    logStep(orderId, "tmp.cleanup.stale_done", {
+      removedDirs: stale.removed,
+      freedBytes: stale.freedBytes,
+      freedHuman: formatBytes(stale.freedBytes),
+      usageAfterCleanup: formatBytes(getTmpUsageBytes()),
+    });
 
     const cfg = parseConfiguratorPayload(order);
     const masterAssetId = cfg?.master_asset_id || null;
@@ -206,9 +301,8 @@ async function processOrder(order) {
 
     const masterUrl = `https://storage.googleapis.com/wandini-masters/${masterAssetId}/master.png`;
     const masterPath = path.join(orderDir, "master.png");
-    const croppedPath = path.join(orderDir, "_cropped_tmp.png");
     const xmlPath = path.join(orderDir, "order.xml");
-    logStep(orderId, "paths.prepared", { masterUrl, masterPath, croppedPath, xmlPath });
+    logStep(orderId, "paths.prepared", { masterUrl, masterPath, xmlPath });
 
     await downloadFile(masterUrl, masterPath);
     logStep(orderId, "download.master.done");
@@ -237,28 +331,20 @@ async function processOrder(order) {
       width: Math.round(meta.width * cropRatio.w),
       height: Math.round(meta.height * cropRatio.h),
     };
-    logStep(orderId, "sharp.crop.calculated", crop);
-
-    await image
-      .extract(crop)
-      .png({ compressionLevel: 0 })
-      .toFile(croppedPath);
-
-    logStep(orderId, "sharp.cropped.tmp.saved", { croppedPath });
-
-    const croppedMeta = await sharp(croppedPath, {
-      sequentialRead: true,
-      limitInputPixels: false,
-    }).metadata();
-    const croppedWidthPx = Number(croppedMeta.width || 0);
-    const croppedHeightPx = Number(croppedMeta.height || 0);
-    if (!croppedWidthPx || !croppedHeightPx) {
-      throw new Error("Invalid cropped image dimensions");
-    }
+    const safeCrop = {
+      left: Math.max(0, Math.min(crop.left, Math.max(0, meta.width - 1))),
+      top: Math.max(0, Math.min(crop.top, Math.max(0, meta.height - 1))),
+      width: Math.max(1, Math.min(crop.width, Math.max(1, meta.width - crop.left))),
+      height: Math.max(1, Math.min(crop.height, Math.max(1, meta.height - crop.top))),
+    };
+    logStep(orderId, "sharp.crop.calculated", { requested: crop, safeCrop });
+    const estimatedPanelBytes = Math.ceil(safeCrop.width * safeCrop.height * 4 * 1.1);
+    const estimatedTotalNeedBytes = estimatedPanelBytes + 100 * 1024 * 1024;
+    ensureTmpBudget(orderId, estimatedTotalNeedBytes);
 
     const panelCount = panelInfo.panelCount || 1;
     const panelPxWidths = [];
-    let remainingPx = croppedWidthPx;
+    let remainingPx = safeCrop.width;
     for (let i = 0; i < panelCount; i++) {
       const last = i === panelCount - 1;
       if (last) {
@@ -268,7 +354,7 @@ async function processOrder(order) {
       const remainingPieces = panelCount - i;
       const minReservedForRest = remainingPieces - 1;
       const maxThis = Math.max(1, remainingPx - minReservedForRest);
-      const estimated = Math.round(croppedWidthPx / panelCount);
+      const estimated = Math.round(safeCrop.width / panelCount);
       const currentPx = Math.min(Math.max(estimated, 1), maxThis);
       panelPxWidths.push(currentPx);
       remainingPx -= currentPx;
@@ -277,8 +363,8 @@ async function processOrder(order) {
     logStep(orderId, "sharp.panel.plan", {
       panelCount,
       panelWidthCm: Number(panelInfo.panelWidthCm.toFixed(4)),
-      croppedWidthPx,
-      croppedHeightPx,
+      croppedWidthPx: safeCrop.width,
+      croppedHeightPx: safeCrop.height,
       panelPxWidths,
     });
 
@@ -286,15 +372,15 @@ async function processOrder(order) {
     for (let i = 0; i < panelPxWidths.length; i++) {
       const panelWidthPx = panelPxWidths[i];
       const panelPath = path.join(orderDir, `panel-${i + 1}.png`);
-      await sharp(croppedPath, {
+      await sharp(masterPath, {
         sequentialRead: true,
         limitInputPixels: false,
       })
         .extract({
-          left: offsetLeft,
-          top: 0,
+          left: safeCrop.left + offsetLeft,
+          top: safeCrop.top,
           width: panelWidthPx,
-          height: croppedHeightPx,
+          height: safeCrop.height,
         })
         .png({ compressionLevel: 0 })
         .toFile(panelPath);
@@ -304,15 +390,6 @@ async function processOrder(order) {
         panelPath,
       });
       offsetLeft += panelWidthPx;
-    }
-
-    try {
-      fs.unlinkSync(croppedPath);
-      logStep(orderId, "sharp.cropped.tmp.deleted", { croppedPath });
-    } catch (cleanupErr) {
-      logStep(orderId, "sharp.cropped.tmp.delete_failed", {
-        message: cleanupErr?.message || String(cleanupErr),
-      });
     }
 
     logStep(orderId, "sharp.crop.completed", {
@@ -409,6 +486,26 @@ app.get("/download/:orderId", (req, res) => {
 
   archive.finalize();
   logStep(orderId, "download.archive.finalized");
+
+  res.on("finish", () => {
+    try {
+      const dirSize = getDirSizeBytes(dir);
+      fs.rmSync(dir, { recursive: true, force: true });
+      doneOrders.delete(orderId);
+      doneOrders.delete(Number(orderId));
+      logStep(orderId, "tmp.cleanup.after_download_done", {
+        deletedDir: dir,
+        freedBytes: dirSize,
+        freedHuman: formatBytes(dirSize),
+        usageAfterCleanup: formatBytes(getTmpUsageBytes()),
+      });
+    } catch (err) {
+      logStep(orderId, "tmp.cleanup.after_download_failed", {
+        dir,
+        message: err?.message || String(err),
+      });
+    }
+  });
 });
 
 /**
