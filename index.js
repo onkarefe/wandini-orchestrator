@@ -16,6 +16,7 @@ app.use(express.json({ limit: "20mb" }));
 
 const PORT = process.env.PORT || 10000;
 const BASE_DIR = "/tmp/wandini";
+const MAX_PANEL_CM = 70;
 
 fs.mkdirSync(BASE_DIR, { recursive: true });
 
@@ -30,9 +31,39 @@ function log(orderId, msg) {
   console.log(`[${orderId}] ${msg}`);
 }
 
+function logStep(orderId, step, details = null) {
+  if (details === null || details === undefined) {
+    console.log(`[${orderId}] [${step}]`);
+    return;
+  }
+  console.log(`[${orderId}] [${step}]`, details);
+}
+
+function parseConfiguratorPayload(order) {
+  for (const item of order.line_items || []) {
+    for (const p of item.properties || []) {
+      if (p.name === "configurator_payload" && p.value) {
+        return JSON.parse(p.value);
+      }
+    }
+  }
+  return null;
+}
+
+function computePanelsFromOutputMm(outputWidthMm) {
+  const widthCm = Number(outputWidthMm) / 10;
+  if (!Number.isFinite(widthCm) || widthCm <= 0) {
+    return { widthCm: 0, panelCount: 0, panelWidthCm: 0 };
+  }
+  const panelCount = Math.max(1, Math.ceil(widthCm / MAX_PANEL_CM));
+  const panelWidthCm = widthCm / panelCount;
+  return { widthCm, panelCount, panelWidthCm };
+}
+
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest);
+    const startedAt = Date.now();
 
     https
       .get(url, (res) => {
@@ -40,8 +71,18 @@ function downloadFile(url, dest) {
           reject(new Error(`Download failed: ${res.statusCode}`));
           return;
         }
+        console.log(`[download] started`, { url, statusCode: res.statusCode, dest });
         res.pipe(file);
-        file.on("finish", () => file.close(resolve));
+        file.on("finish", () => {
+          file.close(() => {
+            console.log(`[download] completed`, {
+              url,
+              dest,
+              durationMs: Date.now() - startedAt,
+            });
+            resolve();
+          });
+        });
       })
       .on("error", reject);
   });
@@ -58,6 +99,8 @@ function orderToXML(order, masterAssetId) {
   // Configurator output width/height
   let outputWidth = null;
   let outputHeight = null;
+  let panelCount = 0;
+  let panelWidthCm = 0;
   let quantity = 1;
 
   for (const item of order.line_items || []) {
@@ -68,6 +111,9 @@ function orderToXML(order, masterAssetId) {
         const cfg = JSON.parse(p.value);
         outputWidth = cfg.output?.width;
         outputHeight = cfg.output?.height;
+        const panelInfo = computePanelsFromOutputMm(outputWidth);
+        panelCount = panelInfo.panelCount;
+        panelWidthCm = panelInfo.panelWidthCm;
       }
     }
   }
@@ -110,6 +156,8 @@ function orderToXML(order, masterAssetId) {
       <height unit="mm">${outputHeight}</height>
       <variants>1</variants>
       <copies_per_variant>${quantity}</copies_per_variant>
+      <panel_count>${panelCount}</panel_count>
+      <panel_width_cm>${panelWidthCm.toFixed(4)}</panel_width_cm>
       <files>
         <file type="ftp">${orderNumber}_1.pdf</file>
       </files>
@@ -126,41 +174,48 @@ async function processOrder(order) {
   isProcessing = true;
 
   try {
-    log(orderId, "Processing started");
+    logStep(orderId, "processing.start", {
+      queueLength: queue.length,
+      lineItemCount: (order.line_items || []).length,
+    });
 
-    let masterAssetId = null;
-    let cropRatio = null;
+    const cfg = parseConfiguratorPayload(order);
+    const masterAssetId = cfg?.master_asset_id || null;
+    const cropRatio = cfg?.crop_ratio || null;
+    const outputWidthMm = cfg?.output?.width;
+    const outputHeightMm = cfg?.output?.height;
 
-    for (const item of order.line_items || []) {
-      for (const p of item.properties || []) {
-        if (p.name === "configurator_payload") {
-          const cfg = JSON.parse(p.value);
-          masterAssetId = cfg.master_asset_id;
-          cropRatio = cfg.crop_ratio;
-        }
-      }
-    }
+    const panelInfo = computePanelsFromOutputMm(outputWidthMm);
+    logStep(orderId, "configurator.payload", {
+      version: cfg?.version ?? null,
+      masterAssetId,
+      output: { widthMm: outputWidthMm, heightMm: outputHeightMm, unit: cfg?.output?.unit },
+      cropRatio,
+      panelCount: panelInfo.panelCount,
+      panelWidthCm: Number(panelInfo.panelWidthCm.toFixed(4)),
+    });
 
     if (!masterAssetId || !cropRatio) {
-      log(orderId, "Missing configurator data, skipping");
+      logStep(orderId, "processing.skip", "Missing configurator data");
       return;
     }
 
     const orderDir = path.join(BASE_DIR, String(orderId));
     fs.mkdirSync(orderDir, { recursive: true });
+    logStep(orderId, "fs.orderDir.ready", { orderDir });
 
     const masterUrl = `https://storage.googleapis.com/wandini-masters/${masterAssetId}/master.png`;
     const masterPath = path.join(orderDir, "master.png");
-    const croppedPath = path.join(orderDir, "cropped.png");
     const xmlPath = path.join(orderDir, "order.xml");
+    logStep(orderId, "paths.prepared", { masterUrl, masterPath, xmlPath });
 
     await downloadFile(masterUrl, masterPath);
-    log(orderId, "Master file downloaded");
+    logStep(orderId, "download.master.done");
 
     fs.writeFileSync(xmlPath, orderToXML(order, masterAssetId));
-    log(orderId, "XML created");
+    logStep(orderId, "xml.created", { xmlPath });
 
-    log(orderId, "Sharp started");
+    logStep(orderId, "sharp.start");
     const t0 = Date.now();
 
     const image = sharp(masterPath, {
@@ -169,6 +224,11 @@ async function processOrder(order) {
     });
 
     const meta = await image.metadata();
+    logStep(orderId, "sharp.metadata", {
+      width: meta.width,
+      height: meta.height,
+      format: meta.format,
+    });
 
     const crop = {
       left: Math.round(meta.width * cropRatio.x),
@@ -176,20 +236,89 @@ async function processOrder(order) {
       width: Math.round(meta.width * cropRatio.w),
       height: Math.round(meta.height * cropRatio.h),
     };
+    logStep(orderId, "sharp.crop.calculated", crop);
 
-    await image.extract(crop).png({ compressionLevel: 0 }).toFile(croppedPath);
+    const croppedBuffer = await image
+      .extract(crop)
+      .png({ compressionLevel: 0 })
+      .toBuffer();
 
-    log(orderId, `Crop completed (${Date.now() - t0} ms)`);
+    const croppedMeta = await sharp(croppedBuffer).metadata();
+    const croppedWidthPx = Number(croppedMeta.width || 0);
+    const croppedHeightPx = Number(croppedMeta.height || 0);
+    if (!croppedWidthPx || !croppedHeightPx) {
+      throw new Error("Invalid cropped image dimensions");
+    }
 
-    log(orderId, `ZIP ready: /download/${orderId}`);
+    const panelCount = panelInfo.panelCount || 1;
+    const panelPxWidths = [];
+    let remainingPx = croppedWidthPx;
+    for (let i = 0; i < panelCount; i++) {
+      const last = i === panelCount - 1;
+      if (last) {
+        panelPxWidths.push(Math.max(1, remainingPx));
+        break;
+      }
+      const remainingPieces = panelCount - i;
+      const minReservedForRest = remainingPieces - 1;
+      const maxThis = Math.max(1, remainingPx - minReservedForRest);
+      const estimated = Math.round(croppedWidthPx / panelCount);
+      const currentPx = Math.min(Math.max(estimated, 1), maxThis);
+      panelPxWidths.push(currentPx);
+      remainingPx -= currentPx;
+    }
+
+    logStep(orderId, "sharp.panel.plan", {
+      panelCount,
+      panelWidthCm: Number(panelInfo.panelWidthCm.toFixed(4)),
+      croppedWidthPx,
+      croppedHeightPx,
+      panelPxWidths,
+    });
+
+    let offsetLeft = 0;
+    for (let i = 0; i < panelPxWidths.length; i++) {
+      const panelWidthPx = panelPxWidths[i];
+      const panelPath = path.join(orderDir, `panel-${i + 1}.png`);
+      await sharp(croppedBuffer)
+        .extract({
+          left: offsetLeft,
+          top: 0,
+          width: panelWidthPx,
+          height: croppedHeightPx,
+        })
+        .png({ compressionLevel: 0 })
+        .toFile(panelPath);
+      logStep(orderId, "sharp.panel.saved", {
+        panelIndex: i + 1,
+        panelWidthPx,
+        panelPath,
+      });
+      offsetLeft += panelWidthPx;
+    }
+
+    logStep(orderId, "sharp.crop.completed", {
+      durationMs: Date.now() - t0,
+      panelCount,
+    });
+
+    logStep(orderId, "processing.done", { downloadPath: `/download/${orderId}` });
     doneOrders.add(orderId);
   } catch (err) {
-    console.error(`[${orderId}] PROCESS ERROR:`, err);
+    console.error(`[${orderId}] [processing.error]`, {
+      message: err?.message,
+      stack: err?.stack,
+    });
   } finally {
     isProcessing = false;
+    logStep(orderId, "processing.finally", {
+      queueLengthAfter: queue.length,
+      doneOrdersCount: doneOrders.size,
+    });
 
     if (queue.length > 0) {
       const next = queue.shift();
+      logStep(orderId, "queue.dequeue.next", { nextOrderId: next?.id, queueLengthNow: queue.length });
       processOrder(next);
     }
   }
@@ -201,21 +330,27 @@ async function processOrder(order) {
 app.post("/webhooks/orders-paid", (req, res) => {
   const order = req.body;
   const orderId = order.id;
+  logStep(orderId || "unknown", "webhook.received", {
+    hasId: !!orderId,
+    lineItemCount: (order?.line_items || []).length,
+    financialStatus: order?.financial_status || null,
+  });
 
   if (!orderId) return res.status(400).send("order.id missing");
 
   if (doneOrders.has(orderId)) {
-    log(orderId, "Already done, skipping");
+    logStep(orderId, "webhook.skip.already_done");
     return res.status(200).send("ok");
   }
 
   if (isProcessing) {
-    log(orderId, "Queued (worker busy)");
+    logStep(orderId, "webhook.queued.worker_busy", { queueLengthBefore: queue.length });
     queue.push(order);
+    logStep(orderId, "webhook.queued", { queueLengthAfter: queue.length });
     return res.status(200).send("queued");
   }
 
-  log(orderId, "Accepted for processing");
+  logStep(orderId, "webhook.accepted");
   processOrder(order);
   res.status(200).send("processing");
 });
@@ -226,8 +361,10 @@ app.post("/webhooks/orders-paid", (req, res) => {
 app.get("/download/:orderId", (req, res) => {
   const { orderId } = req.params;
   const dir = path.join(BASE_DIR, orderId);
+  logStep(orderId, "download.requested", { dir });
 
   if (!fs.existsSync(dir)) {
+    logStep(orderId, "download.not_found");
     return res.status(404).send("Order artifacts not found");
   }
 
@@ -239,11 +376,21 @@ app.get("/download/:orderId", (req, res) => {
 
   const archive = archiver("zip", { zlib: { level: 9 } });
   archive.pipe(res);
+  logStep(orderId, "download.archive.start");
 
   archive.file(path.join(dir, "order.xml"), { name: "order.xml" });
-  archive.file(path.join(dir, "cropped.png"), { name: "cropped.png" });
+  const panelFiles = fs
+    .readdirSync(dir)
+    .filter((name) => /^panel-\d+\.png$/.test(name))
+    .sort((a, b) => Number(a.match(/\d+/)?.[0] || 0) - Number(b.match(/\d+/)?.[0] || 0));
+
+  for (const fileName of panelFiles) {
+    archive.file(path.join(dir, fileName), { name: fileName });
+  }
+  logStep(orderId, "download.archive.files", { count: panelFiles.length, files: panelFiles });
 
   archive.finalize();
+  logStep(orderId, "download.archive.finalized");
 });
 
 /**
