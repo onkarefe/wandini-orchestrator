@@ -106,10 +106,61 @@ function cleanupStaleArtifacts(orderId) {
   return { removed, freedBytes };
 }
 
+function listOrderDirs() {
+  if (!fs.existsSync(BASE_DIR)) return [];
+  const dirs = [];
+  for (const entry of fs.readdirSync(BASE_DIR)) {
+    const dirPath = path.join(BASE_DIR, entry);
+    try {
+      const stat = fs.statSync(dirPath);
+      if (!stat.isDirectory()) continue;
+      dirs.push({
+        entry,
+        dirPath,
+        mtimeMs: stat.mtimeMs,
+        sizeBytes: getDirSizeBytes(dirPath),
+      });
+    } catch {
+      // ignore broken entry
+    }
+  }
+  return dirs.sort((a, b) => a.mtimeMs - b.mtimeMs);
+}
+
+function cleanupForBudget(orderId, requiredFreeBytes, excludeOrderId = null) {
+  const dirs = listOrderDirs();
+  let freedBytes = 0;
+  const removedDirs = [];
+
+  for (const d of dirs) {
+    if (excludeOrderId !== null && String(d.entry) === String(excludeOrderId)) continue;
+    if (freedBytes >= requiredFreeBytes) break;
+    try {
+      fs.rmSync(d.dirPath, { recursive: true, force: true });
+      freedBytes += d.sizeBytes;
+      removedDirs.push(d.dirPath);
+      doneOrders.delete(d.entry);
+      doneOrders.delete(Number(d.entry));
+      logStep(orderId, "tmp.cleanup.budget.removed", {
+        dirPath: d.dirPath,
+        freedBytes: d.sizeBytes,
+        freedHuman: formatBytes(d.sizeBytes),
+      });
+    } catch (err) {
+      logStep(orderId, "tmp.cleanup.budget.remove_failed", {
+        dirPath: d.dirPath,
+        message: err?.message || String(err),
+      });
+    }
+  }
+
+  return { freedBytes, removedDirs };
+}
+
 function ensureTmpBudget(orderId, estimatedNeedBytes) {
-  const usage = getTmpUsageBytes();
-  const available = Math.max(0, TMP_LIMIT_BYTES - usage);
-  const availableSafe = Math.max(0, available - TMP_SAFETY_BYTES);
+  let usage = getTmpUsageBytes();
+  let available = Math.max(0, TMP_LIMIT_BYTES - usage);
+  let availableSafe = Math.max(0, available - TMP_SAFETY_BYTES);
   logStep(orderId, "tmp.budget.check", {
     usageBytes: usage,
     usageHuman: formatBytes(usage),
@@ -120,11 +171,57 @@ function ensureTmpBudget(orderId, estimatedNeedBytes) {
     availableSafeBytes: availableSafe,
     availableSafeHuman: formatBytes(availableSafe),
   });
+
   if (estimatedNeedBytes > availableSafe) {
-    throw new Error(
-      `Insufficient /tmp space: need ${formatBytes(estimatedNeedBytes)}, safe-available ${formatBytes(availableSafe)}`,
-    );
+    const needToFree = estimatedNeedBytes - availableSafe;
+    logStep(orderId, "tmp.budget.cleanup_needed", {
+      needToFreeBytes: needToFree,
+      needToFreeHuman: formatBytes(needToFree),
+    });
+    const cleanup = cleanupForBudget(orderId, needToFree, orderId);
+    usage = getTmpUsageBytes();
+    available = Math.max(0, TMP_LIMIT_BYTES - usage);
+    availableSafe = Math.max(0, available - TMP_SAFETY_BYTES);
+    logStep(orderId, "tmp.budget.after_cleanup", {
+      cleanedBytes: cleanup.freedBytes,
+      cleanedHuman: formatBytes(cleanup.freedBytes),
+      removedDirs: cleanup.removedDirs.length,
+      usageBytes: usage,
+      usageHuman: formatBytes(usage),
+      availableSafeBytes: availableSafe,
+      availableSafeHuman: formatBytes(availableSafe),
+    });
+    if (estimatedNeedBytes > availableSafe) {
+      throw new Error(
+        `Insufficient /tmp space: need ${formatBytes(estimatedNeedBytes)}, safe-available ${formatBytes(availableSafe)}`,
+      );
+    }
   }
+}
+
+function createZipFile(orderId, zipPath, files) {
+  return new Promise((resolve, reject) => {
+    const output = fs.createWriteStream(zipPath);
+    const archive = archiver("zip", { zlib: { level: 9 } });
+
+    output.on("close", () => {
+      logStep(orderId, "zip.created", {
+        zipPath,
+        bytes: archive.pointer(),
+        bytesHuman: formatBytes(archive.pointer()),
+      });
+      resolve();
+    });
+    output.on("error", reject);
+    archive.on("error", reject);
+
+    archive.pipe(output);
+    for (const f of files) {
+      if (!fs.existsSync(f.path)) continue;
+      archive.file(f.path, { name: f.name });
+    }
+    archive.finalize();
+  });
 }
 
 function parseConfiguratorPayload(order) {
@@ -302,6 +399,7 @@ async function processOrder(order) {
     const masterUrl = `https://storage.googleapis.com/wandini-masters/${masterAssetId}/master.png`;
     const masterPath = path.join(orderDir, "master.png");
     const xmlPath = path.join(orderDir, "order.xml");
+    const zipPath = path.join(orderDir, `wandini-${orderId}.zip`);
     logStep(orderId, "paths.prepared", { masterUrl, masterPath, xmlPath });
 
     await downloadFile(masterUrl, masterPath);
@@ -334,11 +432,11 @@ async function processOrder(order) {
     const safeCrop = {
       left: Math.max(0, Math.min(crop.left, Math.max(0, meta.width - 1))),
       top: Math.max(0, Math.min(crop.top, Math.max(0, meta.height - 1))),
-      width: Math.max(1, Math.min(crop.width, Math.max(1, meta.width - crop.left))),
-      height: Math.max(1, Math.min(crop.height, Math.max(1, meta.height - crop.top))),
+      width: Math.max(1, Math.min(crop.width, Math.max(1, meta.width - Math.max(0, Math.min(crop.left, Math.max(0, meta.width - 1)))))),
+      height: Math.max(1, Math.min(crop.height, Math.max(1, meta.height - Math.max(0, Math.min(crop.top, Math.max(0, meta.height - 1)))))),
     };
     logStep(orderId, "sharp.crop.calculated", { requested: crop, safeCrop });
-    const estimatedPanelBytes = Math.ceil(safeCrop.width * safeCrop.height * 4 * 1.1);
+    const estimatedPanelBytes = Math.ceil(safeCrop.width * safeCrop.height * 1.2);
     const estimatedTotalNeedBytes = estimatedPanelBytes + 100 * 1024 * 1024;
     ensureTmpBudget(orderId, estimatedTotalNeedBytes);
 
@@ -369,6 +467,7 @@ async function processOrder(order) {
     });
 
     let offsetLeft = 0;
+    const panelFiles = [];
     for (let i = 0; i < panelPxWidths.length; i++) {
       const panelWidthPx = panelPxWidths[i];
       const panelPath = path.join(orderDir, `panel-${i + 1}.png`);
@@ -389,12 +488,33 @@ async function processOrder(order) {
         panelWidthPx,
         panelPath,
       });
+      panelFiles.push(panelPath);
       offsetLeft += panelWidthPx;
     }
 
     logStep(orderId, "sharp.crop.completed", {
       durationMs: Date.now() - t0,
       panelCount,
+    });
+
+    await createZipFile(orderId, zipPath, [
+      { path: xmlPath, name: "order.xml" },
+      ...panelFiles.map((p) => ({ path: p, name: path.basename(p) })),
+    ]);
+
+    for (const p of [masterPath, xmlPath, ...panelFiles]) {
+      try {
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+      } catch (cleanupErr) {
+        logStep(orderId, "tmp.cleanup.source_file_failed", {
+          file: p,
+          message: cleanupErr?.message || String(cleanupErr),
+        });
+      }
+    }
+    logStep(orderId, "tmp.cleanup.source_files_done", {
+      keptZip: zipPath,
+      usageAfterCleanup: formatBytes(getTmpUsageBytes()),
     });
 
     logStep(orderId, "processing.done", { downloadPath: `/download/${orderId}` });
@@ -404,6 +524,22 @@ async function processOrder(order) {
       message: err?.message,
       stack: err?.stack,
     });
+    try {
+      const orderDir = path.join(BASE_DIR, String(orderId));
+      if (fs.existsSync(orderDir)) {
+        const dirSize = getDirSizeBytes(orderDir);
+        fs.rmSync(orderDir, { recursive: true, force: true });
+        logStep(orderId, "tmp.cleanup.after_error_done", {
+          removedDir: orderDir,
+          freedBytes: dirSize,
+          freedHuman: formatBytes(dirSize),
+        });
+      }
+    } catch (cleanupErr) {
+      logStep(orderId, "tmp.cleanup.after_error_failed", {
+        message: cleanupErr?.message || String(cleanupErr),
+      });
+    }
   } finally {
     isProcessing = false;
     logStep(orderId, "processing.finally", {
@@ -456,9 +592,10 @@ app.post("/webhooks/orders-paid", (req, res) => {
 app.get("/download/:orderId", (req, res) => {
   const { orderId } = req.params;
   const dir = path.join(BASE_DIR, orderId);
+  const zipPath = path.join(dir, `wandini-${orderId}.zip`);
   logStep(orderId, "download.requested", { dir });
 
-  if (!fs.existsSync(dir)) {
+  if (!fs.existsSync(dir) || !fs.existsSync(zipPath)) {
     logStep(orderId, "download.not_found");
     return res.status(404).send("Order artifacts not found");
   }
@@ -469,23 +606,13 @@ app.get("/download/:orderId", (req, res) => {
     `attachment; filename=wandini-${orderId}.zip`,
   );
 
-  const archive = archiver("zip", { zlib: { level: 9 } });
-  archive.pipe(res);
-  logStep(orderId, "download.archive.start");
-
-  archive.file(path.join(dir, "order.xml"), { name: "order.xml" });
-  const panelFiles = fs
-    .readdirSync(dir)
-    .filter((name) => /^panel-\d+\.png$/.test(name))
-    .sort((a, b) => Number(a.match(/\d+/)?.[0] || 0) - Number(b.match(/\d+/)?.[0] || 0));
-
-  for (const fileName of panelFiles) {
-    archive.file(path.join(dir, fileName), { name: fileName });
-  }
-  logStep(orderId, "download.archive.files", { count: panelFiles.length, files: panelFiles });
-
-  archive.finalize();
-  logStep(orderId, "download.archive.finalized");
+  logStep(orderId, "download.zip.stream.start", { zipPath });
+  const zipStream = fs.createReadStream(zipPath);
+  zipStream.on("error", (err) => {
+    logStep(orderId, "download.zip.stream.error", { message: err?.message || String(err) });
+    if (!res.headersSent) res.status(500).send("zip stream error");
+  });
+  zipStream.pipe(res);
 
   res.on("finish", () => {
     try {
