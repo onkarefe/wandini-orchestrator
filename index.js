@@ -206,8 +206,9 @@ async function processOrder(order) {
 
     const masterUrl = `https://storage.googleapis.com/wandini-masters/${masterAssetId}/master.png`;
     const masterPath = path.join(orderDir, "master.png");
+    const croppedPath = path.join(orderDir, "_cropped_tmp.png");
     const xmlPath = path.join(orderDir, "order.xml");
-    logStep(orderId, "paths.prepared", { masterUrl, masterPath, xmlPath });
+    logStep(orderId, "paths.prepared", { masterUrl, masterPath, croppedPath, xmlPath });
 
     await downloadFile(masterUrl, masterPath);
     logStep(orderId, "download.master.done");
@@ -238,12 +239,17 @@ async function processOrder(order) {
     };
     logStep(orderId, "sharp.crop.calculated", crop);
 
-    const croppedBuffer = await image
+    await image
       .extract(crop)
       .png({ compressionLevel: 0 })
-      .toBuffer();
+      .toFile(croppedPath);
 
-    const croppedMeta = await sharp(croppedBuffer).metadata();
+    logStep(orderId, "sharp.cropped.tmp.saved", { croppedPath });
+
+    const croppedMeta = await sharp(croppedPath, {
+      sequentialRead: true,
+      limitInputPixels: false,
+    }).metadata();
     const croppedWidthPx = Number(croppedMeta.width || 0);
     const croppedHeightPx = Number(croppedMeta.height || 0);
     if (!croppedWidthPx || !croppedHeightPx) {
@@ -280,7 +286,10 @@ async function processOrder(order) {
     for (let i = 0; i < panelPxWidths.length; i++) {
       const panelWidthPx = panelPxWidths[i];
       const panelPath = path.join(orderDir, `panel-${i + 1}.png`);
-      await sharp(croppedBuffer)
+      await sharp(croppedPath, {
+        sequentialRead: true,
+        limitInputPixels: false,
+      })
         .extract({
           left: offsetLeft,
           top: 0,
@@ -295,6 +304,15 @@ async function processOrder(order) {
         panelPath,
       });
       offsetLeft += panelWidthPx;
+    }
+
+    try {
+      fs.unlinkSync(croppedPath);
+      logStep(orderId, "sharp.cropped.tmp.deleted", { croppedPath });
+    } catch (cleanupErr) {
+      logStep(orderId, "sharp.cropped.tmp.delete_failed", {
+        message: cleanupErr?.message || String(cleanupErr),
+      });
     }
 
     logStep(orderId, "sharp.crop.completed", {
