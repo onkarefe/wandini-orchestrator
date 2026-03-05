@@ -248,6 +248,31 @@ function buildPanelPixelWidths(totalWidthPx, panelCount) {
   return widths;
 }
 
+function createZipFromFiles(orderId, zipPath, files) {
+  return new Promise((resolve, reject) => {
+    const output = fs.createWriteStream(zipPath);
+    const archive = archiver("zip", { zlib: { level: 9 } });
+
+    output.on("close", () => {
+      logStep(orderId, "zip.created", {
+        zipPath,
+        bytes: archive.pointer(),
+        bytesHuman: formatBytes(archive.pointer()),
+      });
+      resolve();
+    });
+    output.on("error", reject);
+    archive.on("error", reject);
+
+    archive.pipe(output);
+    for (const f of files) {
+      if (!fs.existsSync(f.path)) continue;
+      archive.file(f.path, { name: f.name });
+    }
+    archive.finalize();
+  });
+}
+
 function computePanelsFromOutputMm(outputWidthMm) {
   const widthCm = Number(outputWidthMm) / 10;
   if (!Number.isFinite(widthCm) || widthCm <= 0) {
@@ -412,7 +437,7 @@ async function processOrder(order) {
     const masterUrl = `https://storage.googleapis.com/wandini-masters/${masterAssetId}/master.png`;
     const masterPath = path.join(orderDir, "master.png");
     const xmlPath = path.join(orderDir, "order.xml");
-    const manifestPath = path.join(orderDir, "manifest.json");
+    const partsPath = path.join(orderDir, "parts.json");
     logStep(orderId, "paths.prepared", { masterUrl, masterPath, xmlPath });
 
     await downloadFile(masterUrl, masterPath);
@@ -469,26 +494,82 @@ async function processOrder(order) {
       panelCount,
     });
 
-    const manifest = {
-      orderId: String(orderId),
-      masterPath,
-      safeCrop,
-      panelPxWidths,
-      panelCount,
-      panelWidthCm: Number(panelInfo.panelWidthCm.toFixed(4)),
-      createdAt: new Date().toISOString(),
-    };
-    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
-    logStep(orderId, "manifest.created", {
-      manifestPath,
-      panelCount: manifest.panelCount,
+    const partFiles = [];
+    let offsetLeft = 0;
+    for (let i = 0; i < panelPxWidths.length; i++) {
+      const panelWidthPx = panelPxWidths[i];
+      const panelTmpPath = path.join(orderDir, `panel-tmp-${i + 1}.png`);
+      const partZipName = `${orderId}-${i + 1}.zip`;
+      const partZipPath = path.join(orderDir, partZipName);
+
+      await sharp(masterPath, {
+        sequentialRead: true,
+        limitInputPixels: false,
+      })
+        .extract({
+          left: safeCrop.left + offsetLeft,
+          top: safeCrop.top,
+          width: panelWidthPx,
+          height: safeCrop.height,
+        })
+        .png({ compressionLevel: 0 })
+        .toFile(panelTmpPath);
+      logStep(orderId, "sharp.panel.tmp_saved", {
+        panelIndex: i + 1,
+        panelWidthPx,
+        panelTmpPath,
+      });
+
+      await createZipFromFiles(orderId, partZipPath, [
+        { path: xmlPath, name: "order.xml" },
+        { path: panelTmpPath, name: `panel-${i + 1}.png` },
+      ]);
+      partFiles.push({
+        panelIndex: i + 1,
+        panelWidthPx,
+        zipName: partZipName,
+        zipPath: partZipPath,
+      });
+
+      try {
+        if (fs.existsSync(panelTmpPath)) fs.unlinkSync(panelTmpPath);
+        logStep(orderId, "sharp.panel.tmp_deleted", { panelTmpPath });
+      } catch (cleanupErr) {
+        logStep(orderId, "sharp.panel.tmp_delete_failed", {
+          panelTmpPath,
+          message: cleanupErr?.message || String(cleanupErr),
+        });
+      }
+      assertTmpUsageSafe(orderId, `part_zip_created_${i + 1}`);
+      offsetLeft += panelWidthPx;
+    }
+
+    fs.writeFileSync(partsPath, JSON.stringify(partFiles, null, 2));
+    logStep(orderId, "parts.created", {
+      partsPath,
+      count: partFiles.length,
+      files: partFiles.map((p) => p.zipName),
     });
+
+    try {
+      if (fs.existsSync(masterPath)) fs.unlinkSync(masterPath);
+      if (fs.existsSync(xmlPath)) fs.unlinkSync(xmlPath);
+      logStep(orderId, "tmp.cleanup.source_deleted", { masterPath, xmlPath });
+    } catch (cleanupErr) {
+      logStep(orderId, "tmp.cleanup.source_delete_failed", {
+        message: cleanupErr?.message || String(cleanupErr),
+      });
+    }
 
     const downloadPath = `/download/${orderId}`;
     const downloadUrl = PUBLIC_BASE_URL
       ? `${String(PUBLIC_BASE_URL).replace(/\/+$/, "")}${downloadPath}`
       : null;
-    logStep(orderId, "processing.done", { downloadPath, downloadUrl });
+    const partUrls = partFiles.map((p) => ({
+      panelIndex: p.panelIndex,
+      url: `${String(PUBLIC_BASE_URL).replace(/\/+$/, "")}/download/${orderId}/${p.panelIndex}`,
+    }));
+    logStep(orderId, "processing.done", { downloadPath, downloadUrl, partUrls });
     doneOrders.add(orderId);
   } catch (err) {
     console.error(`[${orderId}] [processing.error]`, {
@@ -563,89 +644,60 @@ app.post("/webhooks/orders-paid", (req, res) => {
 app.get("/download/:orderId", (req, res) => {
   const { orderId } = req.params;
   const dir = path.join(BASE_DIR, orderId);
-  const xmlPath = path.join(dir, "order.xml");
-  const manifestPath = path.join(dir, "manifest.json");
+  const partsPath = path.join(dir, "parts.json");
   logStep(orderId, "download.requested", { dir });
 
-  if (!fs.existsSync(dir) || !fs.existsSync(xmlPath) || !fs.existsSync(manifestPath)) {
+  if (!fs.existsSync(dir) || !fs.existsSync(partsPath)) {
     logStep(orderId, "download.not_found");
     return res.status(404).send("Order artifacts not found");
   }
-
-  res.setHeader("Content-Type", "application/zip");
-  res.setHeader(
-    "Content-Disposition",
-    `attachment; filename=wandini-${orderId}.zip`,
-  );
-
-  const archive = archiver("zip", { zlib: { level: 9 } });
-  archive.on("error", (err) => {
-    logStep(orderId, "download.archive.error", { message: err?.message || String(err) });
-    if (!res.headersSent) res.status(500).send("archive error");
-  });
-  archive.pipe(res);
-
-  let manifest;
+  let parts;
   try {
-    manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    parts = JSON.parse(fs.readFileSync(partsPath, "utf8"));
   } catch (err) {
-    logStep(orderId, "download.manifest.error", { message: err?.message || String(err) });
-    return res.status(500).send("manifest error");
+    logStep(orderId, "download.parts.error", { message: err?.message || String(err) });
+    return res.status(500).send("parts error");
   }
 
-  logStep(orderId, "download.archive.start");
-  archive.file(xmlPath, { name: "order.xml" });
+  const urls = (parts || []).map((p) => ({
+    panelIndex: p.panelIndex,
+    url: `${String(PUBLIC_BASE_URL).replace(/\/+$/, "")}/download/${orderId}/${p.panelIndex}`,
+  }));
+  logStep(orderId, "download.list.returned", { count: urls.length });
+  res.status(200).json({ orderId, parts: urls });
+});
 
-  let offsetLeft = 0;
-  for (let i = 0; i < (manifest.panelPxWidths || []).length; i++) {
-    const panelWidthPx = manifest.panelPxWidths[i];
-    const panelName = `panel-${i + 1}.png`;
-    const panelStream = sharp(manifest.masterPath, {
-      sequentialRead: true,
-      limitInputPixels: false,
-    })
-      .extract({
-        left: manifest.safeCrop.left + offsetLeft,
-        top: manifest.safeCrop.top,
-        width: panelWidthPx,
-        height: manifest.safeCrop.height,
-      })
-      .png({ compressionLevel: 0 });
+app.get("/download/:orderId/:panelIndex", (req, res) => {
+  const { orderId, panelIndex } = req.params;
+  const dir = path.join(BASE_DIR, orderId);
+  const partsPath = path.join(dir, "parts.json");
+  logStep(orderId, "download.part.requested", { panelIndex });
 
-    archive.append(panelStream, { name: panelName });
-    logStep(orderId, "download.archive.panel_stream_added", {
-      panelIndex: i + 1,
-      panelWidthPx,
-      panelName,
-    });
-    offsetLeft += panelWidthPx;
+  if (!fs.existsSync(dir) || !fs.existsSync(partsPath)) {
+    logStep(orderId, "download.part.not_found", { panelIndex });
+    return res.status(404).send("Order artifacts not found");
   }
-  logStep(orderId, "download.archive.files", {
-    count: (manifest.panelPxWidths || []).length,
-    hasXml: true,
-  });
-  archive.finalize();
-  logStep(orderId, "download.archive.finalized");
 
-  res.on("finish", () => {
-    try {
-      const dirSize = getDirSizeBytes(dir);
-      fs.rmSync(dir, { recursive: true, force: true });
-      doneOrders.delete(orderId);
-      doneOrders.delete(Number(orderId));
-      logStep(orderId, "tmp.cleanup.after_download_done", {
-        deletedDir: dir,
-        freedBytes: dirSize,
-        freedHuman: formatBytes(dirSize),
-        usageAfterCleanup: formatBytes(getTmpUsageBytes()),
-      });
-    } catch (err) {
-      logStep(orderId, "tmp.cleanup.after_download_failed", {
-        dir,
-        message: err?.message || String(err),
-      });
-    }
+  let parts;
+  try {
+    parts = JSON.parse(fs.readFileSync(partsPath, "utf8"));
+  } catch (err) {
+    logStep(orderId, "download.part.parts_error", { message: err?.message || String(err) });
+    return res.status(500).send("parts error");
+  }
+
+  const selected = (parts || []).find((p) => String(p.panelIndex) === String(panelIndex));
+  if (!selected || !selected.zipPath || !fs.existsSync(selected.zipPath)) {
+    logStep(orderId, "download.part.file_not_found", { panelIndex });
+    return res.status(404).send("Part zip not found");
+  }
+
+  logStep(orderId, "download.part.stream.start", {
+    panelIndex,
+    zipName: selected.zipName,
+    zipPath: selected.zipPath,
   });
+  res.download(selected.zipPath, selected.zipName);
 });
 
 /**
