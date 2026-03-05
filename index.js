@@ -17,6 +17,7 @@ app.use(express.json({ limit: "20mb" }));
 const PORT = process.env.PORT || 10000;
 const BASE_DIR = "/tmp/wandini";
 const MAX_PANEL_CM = 70;
+const PUBLIC_BASE_URL = "https://wandini-orchestrator.onrender.com";
 const TMP_LIMIT_BYTES = 2 * 1024 * 1024 * 1024; // Render /tmp hard limit (2GB)
 const TMP_SAFETY_BYTES = 200 * 1024 * 1024; // Leave headroom to avoid eviction
 const ARTIFACT_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
@@ -199,29 +200,21 @@ function ensureTmpBudget(orderId, estimatedNeedBytes) {
   }
 }
 
-function createZipFile(orderId, zipPath, files) {
-  return new Promise((resolve, reject) => {
-    const output = fs.createWriteStream(zipPath);
-    const archive = archiver("zip", { zlib: { level: 9 } });
-
-    output.on("close", () => {
-      logStep(orderId, "zip.created", {
-        zipPath,
-        bytes: archive.pointer(),
-        bytesHuman: formatBytes(archive.pointer()),
-      });
-      resolve();
-    });
-    output.on("error", reject);
-    archive.on("error", reject);
-
-    archive.pipe(output);
-    for (const f of files) {
-      if (!fs.existsSync(f.path)) continue;
-      archive.file(f.path, { name: f.name });
-    }
-    archive.finalize();
+function assertTmpUsageSafe(orderId, context = "runtime") {
+  const usage = getTmpUsageBytes();
+  const maxAllowed = TMP_LIMIT_BYTES - TMP_SAFETY_BYTES;
+  logStep(orderId, "tmp.usage.check", {
+    context,
+    usageBytes: usage,
+    usageHuman: formatBytes(usage),
+    maxAllowedBytes: maxAllowed,
+    maxAllowedHuman: formatBytes(maxAllowed),
   });
+  if (usage > maxAllowed) {
+    throw new Error(
+      `Unsafe /tmp usage at ${context}: ${formatBytes(usage)} > ${formatBytes(maxAllowed)}`,
+    );
+  }
 }
 
 function parseConfiguratorPayload(order) {
@@ -399,7 +392,6 @@ async function processOrder(order) {
     const masterUrl = `https://storage.googleapis.com/wandini-masters/${masterAssetId}/master.png`;
     const masterPath = path.join(orderDir, "master.png");
     const xmlPath = path.join(orderDir, "order.xml");
-    const zipPath = path.join(orderDir, `wandini-${orderId}.zip`);
     logStep(orderId, "paths.prepared", { masterUrl, masterPath, xmlPath });
 
     await downloadFile(masterUrl, masterPath);
@@ -488,6 +480,7 @@ async function processOrder(order) {
         panelWidthPx,
         panelPath,
       });
+      assertTmpUsageSafe(orderId, `panel_saved_${i + 1}`);
       panelFiles.push(panelPath);
       offsetLeft += panelWidthPx;
     }
@@ -497,27 +490,22 @@ async function processOrder(order) {
       panelCount,
     });
 
-    await createZipFile(orderId, zipPath, [
-      { path: xmlPath, name: "order.xml" },
-      ...panelFiles.map((p) => ({ path: p, name: path.basename(p) })),
-    ]);
-
-    for (const p of [masterPath, xmlPath, ...panelFiles]) {
-      try {
-        if (fs.existsSync(p)) fs.unlinkSync(p);
-      } catch (cleanupErr) {
-        logStep(orderId, "tmp.cleanup.source_file_failed", {
-          file: p,
-          message: cleanupErr?.message || String(cleanupErr),
-        });
-      }
+    try {
+      if (fs.existsSync(masterPath)) fs.unlinkSync(masterPath);
+      logStep(orderId, "tmp.cleanup.master_deleted", { masterPath });
+    } catch (cleanupErr) {
+      logStep(orderId, "tmp.cleanup.master_delete_failed", {
+        file: masterPath,
+        message: cleanupErr?.message || String(cleanupErr),
+      });
     }
-    logStep(orderId, "tmp.cleanup.source_files_done", {
-      keptZip: zipPath,
-      usageAfterCleanup: formatBytes(getTmpUsageBytes()),
-    });
+    assertTmpUsageSafe(orderId, "after_master_delete");
 
-    logStep(orderId, "processing.done", { downloadPath: `/download/${orderId}` });
+    const downloadPath = `/download/${orderId}`;
+    const downloadUrl = PUBLIC_BASE_URL
+      ? `${String(PUBLIC_BASE_URL).replace(/\/+$/, "")}${downloadPath}`
+      : null;
+    logStep(orderId, "processing.done", { downloadPath, downloadUrl });
     doneOrders.add(orderId);
   } catch (err) {
     console.error(`[${orderId}] [processing.error]`, {
@@ -592,10 +580,9 @@ app.post("/webhooks/orders-paid", (req, res) => {
 app.get("/download/:orderId", (req, res) => {
   const { orderId } = req.params;
   const dir = path.join(BASE_DIR, orderId);
-  const zipPath = path.join(dir, `wandini-${orderId}.zip`);
   logStep(orderId, "download.requested", { dir });
 
-  if (!fs.existsSync(dir) || !fs.existsSync(zipPath)) {
+  if (!fs.existsSync(dir)) {
     logStep(orderId, "download.not_found");
     return res.status(404).send("Order artifacts not found");
   }
@@ -606,13 +593,25 @@ app.get("/download/:orderId", (req, res) => {
     `attachment; filename=wandini-${orderId}.zip`,
   );
 
-  logStep(orderId, "download.zip.stream.start", { zipPath });
-  const zipStream = fs.createReadStream(zipPath);
-  zipStream.on("error", (err) => {
-    logStep(orderId, "download.zip.stream.error", { message: err?.message || String(err) });
-    if (!res.headersSent) res.status(500).send("zip stream error");
+  const archive = archiver("zip", { zlib: { level: 9 } });
+  archive.on("error", (err) => {
+    logStep(orderId, "download.archive.error", { message: err?.message || String(err) });
+    if (!res.headersSent) res.status(500).send("archive error");
   });
-  zipStream.pipe(res);
+  archive.pipe(res);
+
+  logStep(orderId, "download.archive.start");
+  archive.file(path.join(dir, "order.xml"), { name: "order.xml" });
+  const panelFiles = fs
+    .readdirSync(dir)
+    .filter((name) => /^panel-\d+\.png$/.test(name))
+    .sort((a, b) => Number(a.match(/\d+/)?.[0] || 0) - Number(b.match(/\d+/)?.[0] || 0));
+  for (const fileName of panelFiles) {
+    archive.file(path.join(dir, fileName), { name: fileName });
+  }
+  logStep(orderId, "download.archive.files", { count: panelFiles.length, files: panelFiles });
+  archive.finalize();
+  logStep(orderId, "download.archive.finalized");
 
   res.on("finish", () => {
     try {
