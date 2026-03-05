@@ -4,6 +4,7 @@ import path from "path";
 import https from "https";
 import archiver from "archiver";
 import sharp from "sharp";
+import { PDFDocument } from "pdf-lib";
 
 /**
  * SHARP GLOBAL AYARLAR
@@ -18,9 +19,18 @@ const PORT = process.env.PORT || 10000;
 const BASE_DIR = "/tmp/wandini";
 const MAX_PANEL_CM = 70;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || null;
-const TMP_LIMIT_BYTES = 2 * 1024 * 1024 * 1024; // Render /tmp hard limit (2GB)
-const TMP_SAFETY_BYTES = 200 * 1024 * 1024; // Leave headroom to avoid eviction
 const ARTIFACT_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+const SUPPRESSED_STEPS = new Set([
+  "configurator.payload",
+  "sharp.metadata",
+  "sharp.crop.calculated",
+  "sharp.panel.plan",
+  "zip.panel.appended",
+  "tmp.budget.check",
+  "tmp.budget.cleanup_needed",
+  "tmp.budget.after_cleanup",
+  "tmp.usage.check",
+]);
 
 fs.mkdirSync(BASE_DIR, { recursive: true });
 
@@ -35,12 +45,36 @@ function log(orderId, msg) {
   console.log(`[${orderId}] ${msg}`);
 }
 
+function xmlEscape(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
 function logStep(orderId, step, details = null) {
+  if (SUPPRESSED_STEPS.has(step)) return;
+
   if (details === null || details === undefined) {
     console.log(`[${orderId}] [${step}]`);
     return;
   }
-  console.log(`[${orderId}] [${step}]`, details);
+
+  const keepDetails =
+    step.includes("error") ||
+    step.includes("failed") ||
+    step.endsWith(".done") ||
+    step === "processing.done" ||
+    step === "download.stream.start" ||
+    step === "download.not_found";
+
+  if (keepDetails) {
+    console.log(`[${orderId}] [${step}]`, details);
+  } else {
+    console.log(`[${orderId}] [${step}]`);
+  }
 }
 
 function formatBytes(bytes) {
@@ -53,6 +87,11 @@ function formatBytes(bytes) {
     idx += 1;
   }
   return `${value.toFixed(2)} ${units[idx]}`;
+}
+
+const PT_PER_MM = 72 / 25.4;
+function mmToPt(mm) {
+  return Number(mm) * PT_PER_MM;
 }
 
 function getDirSizeBytes(targetPath) {
@@ -107,126 +146,29 @@ function cleanupStaleArtifacts(orderId) {
   return { removed, freedBytes };
 }
 
-function listOrderDirs() {
-  if (!fs.existsSync(BASE_DIR)) return [];
-  const dirs = [];
-  for (const entry of fs.readdirSync(BASE_DIR)) {
-    const dirPath = path.join(BASE_DIR, entry);
-    try {
-      const stat = fs.statSync(dirPath);
-      if (!stat.isDirectory()) continue;
-      dirs.push({
-        entry,
-        dirPath,
-        mtimeMs: stat.mtimeMs,
-        sizeBytes: getDirSizeBytes(dirPath),
-      });
-    } catch {
-      // ignore broken entry
-    }
-  }
-  return dirs.sort((a, b) => a.mtimeMs - b.mtimeMs);
-}
-
-function cleanupForBudget(orderId, requiredFreeBytes, excludeOrderId = null) {
-  const dirs = listOrderDirs();
-  let freedBytes = 0;
-  const removedDirs = [];
-
-  for (const d of dirs) {
-    if (excludeOrderId !== null && String(d.entry) === String(excludeOrderId))
-      continue;
-    if (freedBytes >= requiredFreeBytes) break;
-    try {
-      fs.rmSync(d.dirPath, { recursive: true, force: true });
-      freedBytes += d.sizeBytes;
-      removedDirs.push(d.dirPath);
-      doneOrders.delete(d.entry);
-      doneOrders.delete(Number(d.entry));
-      logStep(orderId, "tmp.cleanup.budget.removed", {
-        dirPath: d.dirPath,
-        freedBytes: d.sizeBytes,
-        freedHuman: formatBytes(d.sizeBytes),
-      });
-    } catch (err) {
-      logStep(orderId, "tmp.cleanup.budget.remove_failed", {
-        dirPath: d.dirPath,
-        message: err?.message || String(err),
-      });
-    }
-  }
-
-  return { freedBytes, removedDirs };
-}
-
-function ensureTmpBudget(orderId, estimatedNeedBytes) {
-  let usage = getTmpUsageBytes();
-  let available = Math.max(0, TMP_LIMIT_BYTES - usage);
-  let availableSafe = Math.max(0, available - TMP_SAFETY_BYTES);
-  logStep(orderId, "tmp.budget.check", {
-    usageBytes: usage,
-    usageHuman: formatBytes(usage),
-    estimatedNeedBytes,
-    estimatedNeedHuman: formatBytes(estimatedNeedBytes),
-    availableBytes: available,
-    availableHuman: formatBytes(available),
-    availableSafeBytes: availableSafe,
-    availableSafeHuman: formatBytes(availableSafe),
-  });
-
-  if (estimatedNeedBytes > availableSafe) {
-    const needToFree = estimatedNeedBytes - availableSafe;
-    logStep(orderId, "tmp.budget.cleanup_needed", {
-      needToFreeBytes: needToFree,
-      needToFreeHuman: formatBytes(needToFree),
-    });
-    const cleanup = cleanupForBudget(orderId, needToFree, orderId);
-    usage = getTmpUsageBytes();
-    available = Math.max(0, TMP_LIMIT_BYTES - usage);
-    availableSafe = Math.max(0, available - TMP_SAFETY_BYTES);
-    logStep(orderId, "tmp.budget.after_cleanup", {
-      cleanedBytes: cleanup.freedBytes,
-      cleanedHuman: formatBytes(cleanup.freedBytes),
-      removedDirs: cleanup.removedDirs.length,
-      usageBytes: usage,
-      usageHuman: formatBytes(usage),
-      availableSafeBytes: availableSafe,
-      availableSafeHuman: formatBytes(availableSafe),
-    });
-    if (estimatedNeedBytes > availableSafe) {
-      throw new Error(
-        `Insufficient /tmp space: need ${formatBytes(estimatedNeedBytes)}, safe-available ${formatBytes(availableSafe)}`,
-      );
-    }
-  }
-}
-
-function assertTmpUsageSafe(orderId, context = "runtime") {
-  const usage = getTmpUsageBytes();
-  const maxAllowed = TMP_LIMIT_BYTES - TMP_SAFETY_BYTES;
-  logStep(orderId, "tmp.usage.check", {
-    context,
-    usageBytes: usage,
-    usageHuman: formatBytes(usage),
-    maxAllowedBytes: maxAllowed,
-    maxAllowedHuman: formatBytes(maxAllowed),
-  });
-  if (usage > maxAllowed) {
-    throw new Error(
-      `Unsafe /tmp usage at ${context}: ${formatBytes(usage)} > ${formatBytes(maxAllowed)}`,
-    );
-  }
-}
-
 function parseConfiguratorPayload(order) {
   for (const item of order.line_items || []) {
     for (const p of item.properties || []) {
       if (p.name === "configurator_payload" && p.value) {
-        return JSON.parse(p.value);
+        try {
+          return JSON.parse(p.value);
+        } catch {
+          return null;
+        }
       }
     }
   }
   return null;
+}
+
+function isValidCropRatio(cropRatio) {
+  if (!cropRatio || typeof cropRatio !== "object") return false;
+  const { x, y, w, h } = cropRatio;
+  if (![x, y, w, h].every((v) => Number.isFinite(v))) return false;
+  if (x < 0 || y < 0 || w <= 0 || h <= 0) return false;
+  if (x > 1 || y > 1 || w > 1 || h > 1) return false;
+  if (x + w > 1.000001 || y + h > 1.000001) return false;
+  return true;
 }
 
 function buildPanelPixelWidths(totalWidthPx, panelCount) {
@@ -256,6 +198,8 @@ function createSingleZipFromPlan(
   masterPath,
   safeCrop,
   panelPxWidths,
+  outputWidthMm,
+  outputHeightMm,
 ) {
   return new Promise((resolve, reject) => {
     const output = fs.createWriteStream(zipPath);
@@ -276,30 +220,59 @@ function createSingleZipFromPlan(
     if (fs.existsSync(xmlPath)) {
       archive.file(xmlPath, { name: "order.xml" });
     }
-    let offsetLeft = 0;
-    for (let i = 0; i < panelPxWidths.length; i++) {
-      const panelWidthPx = panelPxWidths[i];
-      const panelName = `panel-${i + 1}.png`;
-      const panelStream = sharp(masterPath, {
-        sequentialRead: true,
-        limitInputPixels: false,
-      })
-        .extract({
-          left: safeCrop.left + offsetLeft,
-          top: safeCrop.top,
-          width: panelWidthPx,
-          height: safeCrop.height,
-        })
-        .png({ compressionLevel: 0 });
-      archive.append(panelStream, { name: panelName });
-      logStep(orderId, "zip.panel.appended", {
-        panelIndex: i + 1,
-        panelWidthPx,
-        panelName,
-      });
-      offsetLeft += panelWidthPx;
-    }
-    archive.finalize();
+
+    (async () => {
+      try {
+        let offsetLeft = 0;
+        const panelCount = panelPxWidths.length || 1;
+        const panelWidthMm = Number(outputWidthMm) / panelCount;
+        const panelHeightMm = Number(outputHeightMm);
+        const pageWidthPt = mmToPt(panelWidthMm);
+        const pageHeightPt = mmToPt(panelHeightMm);
+
+        for (let i = 0; i < panelPxWidths.length; i++) {
+          const panelWidthPx = panelPxWidths[i];
+          const panelName = `panel-${i + 1}.pdf`;
+
+          const panelPngBuffer = await sharp(masterPath, {
+            sequentialRead: true,
+            limitInputPixels: false,
+          })
+            .extract({
+              left: safeCrop.left + offsetLeft,
+              top: safeCrop.top,
+              width: panelWidthPx,
+              height: safeCrop.height,
+            })
+            .png({ compressionLevel: 0 })
+            .toBuffer();
+
+          const pdfDoc = await PDFDocument.create();
+          const embeddedImage = await pdfDoc.embedPng(panelPngBuffer);
+          const page = pdfDoc.addPage([pageWidthPt, pageHeightPt]);
+          page.drawImage(embeddedImage, {
+            x: 0,
+            y: 0,
+            width: pageWidthPt,
+            height: pageHeightPt,
+          });
+
+          const panelPdfBytes = await pdfDoc.save({ useObjectStreams: false });
+          archive.append(Buffer.from(panelPdfBytes), { name: panelName });
+          logStep(orderId, "zip.panel.appended", {
+            panelIndex: i + 1,
+            panelWidthPx,
+            panelName,
+          });
+
+          offsetLeft += panelWidthPx;
+        }
+
+        archive.finalize();
+      } catch (err) {
+        reject(err);
+      }
+    })();
   });
 }
 
@@ -346,12 +319,12 @@ function downloadFile(url, dest) {
 }
 
 function orderToXML(order, masterAssetId) {
-  const orderNumber = order.id;
+  const orderNumber = order?.id ?? "";
 
   const shippingType = "Standard"; // MANUAL (değiştirilebilir)
 
-  const shippingFrom = order.billing_address || {};
-  const shippingTo = order.shipping_address || {};
+  const shippingFrom = order?.billing_address || {};
+  const shippingTo = order?.shipping_address || {};
 
   // Configurator output width/height
   let outputWidth = null;
@@ -365,7 +338,13 @@ function orderToXML(order, masterAssetId) {
 
     for (const p of item.properties || []) {
       if (p.name === "configurator_payload") {
-        const cfg = JSON.parse(p.value);
+        let cfg = null;
+        try {
+          cfg = JSON.parse(p.value);
+        } catch {
+          cfg = null;
+        }
+        if (!cfg) continue;
         outputWidth = cfg.output?.width;
         outputHeight = cfg.output?.height;
         const panelInfo = computePanelsFromOutputMm(outputWidth);
@@ -380,27 +359,27 @@ function orderToXML(order, masterAssetId) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <root>
   <order>
-    <order_number>${orderNumber}</order_number>
+    <order_number>${xmlEscape(orderNumber)}</order_number>
     <reference></reference>
     <shipping_type>${shippingType}</shipping_type>
 
     <shipping_from>
-      <company>${shippingFrom.company || shippingFrom.name || ""}</company>
-      <contact_person>${shippingFrom.name || ""}</contact_person>
-      <street>${shippingFrom.address1 || ""}</street>
-      <postcode>${shippingFrom.zip || ""}</postcode>
-      <city>${shippingFrom.city || ""}</city>
-      <country>${shippingFrom.country_code || ""}</country>
+      <company>${xmlEscape(shippingFrom.company || shippingFrom.name || "")}</company>
+      <contact_person>${xmlEscape(shippingFrom.name || "")}</contact_person>
+      <street>${xmlEscape(shippingFrom.address1 || "")}</street>
+      <postcode>${xmlEscape(shippingFrom.zip || "")}</postcode>
+      <city>${xmlEscape(shippingFrom.city || "")}</city>
+      <country>${xmlEscape(shippingFrom.country_code || "")}</country>
     </shipping_from>
 
     <shipping_to>
-      <company>${shippingTo.company || shippingTo.name || ""}</company>
-      <contact_person>${shippingTo.name || ""}</contact_person>
-      <street>${shippingTo.address1 || ""}</street>
-      <postcode>${shippingTo.zip || ""}</postcode>
-      <city>${shippingTo.city || ""}</city>
-      <country>${shippingTo.country_code || ""}</country>
-      <phone>${shippingTo.phone || ""}</phone>
+      <company>${xmlEscape(shippingTo.company || shippingTo.name || "")}</company>
+      <contact_person>${xmlEscape(shippingTo.name || "")}</contact_person>
+      <street>${xmlEscape(shippingTo.address1 || "")}</street>
+      <postcode>${xmlEscape(shippingTo.zip || "")}</postcode>
+      <city>${xmlEscape(shippingTo.city || "")}</city>
+      <country>${xmlEscape(shippingTo.country_code || "")}</country>
+      <phone>${xmlEscape(shippingTo.phone || "")}</phone>
     </shipping_to>
 
     <delivery_note type="ftp"></delivery_note>
@@ -408,11 +387,11 @@ function orderToXML(order, masterAssetId) {
 
   <positions>
     <position>
-      <sku>${sku}</sku>
-      <width unit="mm">${outputWidth}</width>
-      <height unit="mm">${outputHeight}</height>
+      <sku>${xmlEscape(sku)}</sku>
+      <width unit="mm">${Number.isFinite(Number(outputWidth)) ? Number(outputWidth) : 0}</width>
+      <height unit="mm">${Number.isFinite(Number(outputHeight)) ? Number(outputHeight) : 0}</height>
       <variants>1</variants>
-      <copies_per_variant>${quantity}</copies_per_variant>
+      <copies_per_variant>${Number.isFinite(Number(quantity)) ? Number(quantity) : 1}</copies_per_variant>
       <panel_count>${panelCount}</panel_count>
       <panel_width_cm>${panelWidthCm.toFixed(4)}</panel_width_cm>
       <files>
@@ -448,6 +427,8 @@ async function processOrder(order) {
     const cropRatio = cfg?.crop_ratio || null;
     const outputWidthMm = cfg?.output?.width;
     const outputHeightMm = cfg?.output?.height;
+    const outputWidthMmNum = Number(outputWidthMm);
+    const outputHeightMmNum = Number(outputHeightMm);
 
     const panelInfo = computePanelsFromOutputMm(outputWidthMm);
     logStep(orderId, "configurator.payload", {
@@ -465,6 +446,18 @@ async function processOrder(order) {
 
     if (!masterAssetId || !cropRatio) {
       logStep(orderId, "processing.skip", "Missing configurator data");
+      return;
+    }
+    if (!isValidCropRatio(cropRatio)) {
+      logStep(orderId, "processing.skip", "Invalid crop_ratio");
+      return;
+    }
+    if (!Number.isFinite(outputWidthMmNum) || outputWidthMmNum <= 0) {
+      logStep(orderId, "processing.skip", "Invalid output.width");
+      return;
+    }
+    if (!Number.isFinite(outputHeightMmNum) || outputHeightMmNum <= 0) {
+      logStep(orderId, "processing.skip", "Invalid output.height");
       return;
     }
 
@@ -532,13 +525,6 @@ async function processOrder(order) {
       ),
     };
     logStep(orderId, "sharp.crop.calculated", { requested: crop, safeCrop });
-    const masterSize = fs.existsSync(masterPath)
-      ? fs.statSync(masterPath).size
-      : 0;
-    const estimatedTotalNeedBytes =
-      Math.ceil(masterSize * 1.25) + 150 * 1024 * 1024;
-    ensureTmpBudget(orderId, estimatedTotalNeedBytes);
-
     const panelCount = panelInfo.panelCount || 1;
     const panelPxWidths = buildPanelPixelWidths(safeCrop.width, panelCount);
 
@@ -562,9 +548,9 @@ async function processOrder(order) {
       masterPath,
       safeCrop,
       panelPxWidths,
+      outputWidthMmNum,
+      outputHeightMmNum,
     );
-    assertTmpUsageSafe(orderId, "after_zip_create");
-
     try {
       if (fs.existsSync(masterPath)) fs.unlinkSync(masterPath);
       if (fs.existsSync(xmlPath)) fs.unlinkSync(xmlPath);
@@ -628,8 +614,8 @@ async function processOrder(order) {
  * WEBHOOK
  */
 app.post("/webhooks/orders-paid", (req, res) => {
-  const order = req.body;
-  const orderId = order.id;
+  const order = req.body ?? {};
+  const orderId = order?.id;
   logStep(orderId || "unknown", "webhook.received", {
     hasId: !!orderId,
     lineItemCount: (order?.line_items || []).length,
