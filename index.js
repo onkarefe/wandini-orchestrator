@@ -228,6 +228,26 @@ function parseConfiguratorPayload(order) {
   return null;
 }
 
+function buildPanelPixelWidths(totalWidthPx, panelCount) {
+  const widths = [];
+  let remainingPx = totalWidthPx;
+  for (let i = 0; i < panelCount; i++) {
+    const last = i === panelCount - 1;
+    if (last) {
+      widths.push(Math.max(1, remainingPx));
+      break;
+    }
+    const remainingPieces = panelCount - i;
+    const minReservedForRest = remainingPieces - 1;
+    const maxThis = Math.max(1, remainingPx - minReservedForRest);
+    const estimated = Math.round(totalWidthPx / panelCount);
+    const currentPx = Math.min(Math.max(estimated, 1), maxThis);
+    widths.push(currentPx);
+    remainingPx -= currentPx;
+  }
+  return widths;
+}
+
 function computePanelsFromOutputMm(outputWidthMm) {
   const widthCm = Number(outputWidthMm) / 10;
   if (!Number.isFinite(widthCm) || widthCm <= 0) {
@@ -392,6 +412,7 @@ async function processOrder(order) {
     const masterUrl = `https://storage.googleapis.com/wandini-masters/${masterAssetId}/master.png`;
     const masterPath = path.join(orderDir, "master.png");
     const xmlPath = path.join(orderDir, "order.xml");
+    const manifestPath = path.join(orderDir, "manifest.json");
     logStep(orderId, "paths.prepared", { masterUrl, masterPath, xmlPath });
 
     await downloadFile(masterUrl, masterPath);
@@ -428,27 +449,12 @@ async function processOrder(order) {
       height: Math.max(1, Math.min(crop.height, Math.max(1, meta.height - Math.max(0, Math.min(crop.top, Math.max(0, meta.height - 1)))))),
     };
     logStep(orderId, "sharp.crop.calculated", { requested: crop, safeCrop });
-    const estimatedPanelBytes = Math.ceil(safeCrop.width * safeCrop.height * 1.2);
-    const estimatedTotalNeedBytes = estimatedPanelBytes + 100 * 1024 * 1024;
+    const masterSize = fs.existsSync(masterPath) ? fs.statSync(masterPath).size : 0;
+    const estimatedTotalNeedBytes = Math.ceil(masterSize * 1.25) + 150 * 1024 * 1024;
     ensureTmpBudget(orderId, estimatedTotalNeedBytes);
 
     const panelCount = panelInfo.panelCount || 1;
-    const panelPxWidths = [];
-    let remainingPx = safeCrop.width;
-    for (let i = 0; i < panelCount; i++) {
-      const last = i === panelCount - 1;
-      if (last) {
-        panelPxWidths.push(Math.max(1, remainingPx));
-        break;
-      }
-      const remainingPieces = panelCount - i;
-      const minReservedForRest = remainingPieces - 1;
-      const maxThis = Math.max(1, remainingPx - minReservedForRest);
-      const estimated = Math.round(safeCrop.width / panelCount);
-      const currentPx = Math.min(Math.max(estimated, 1), maxThis);
-      panelPxWidths.push(currentPx);
-      remainingPx -= currentPx;
-    }
+    const panelPxWidths = buildPanelPixelWidths(safeCrop.width, panelCount);
 
     logStep(orderId, "sharp.panel.plan", {
       panelCount,
@@ -458,48 +464,25 @@ async function processOrder(order) {
       panelPxWidths,
     });
 
-    let offsetLeft = 0;
-    const panelFiles = [];
-    for (let i = 0; i < panelPxWidths.length; i++) {
-      const panelWidthPx = panelPxWidths[i];
-      const panelPath = path.join(orderDir, `panel-${i + 1}.png`);
-      await sharp(masterPath, {
-        sequentialRead: true,
-        limitInputPixels: false,
-      })
-        .extract({
-          left: safeCrop.left + offsetLeft,
-          top: safeCrop.top,
-          width: panelWidthPx,
-          height: safeCrop.height,
-        })
-        .png({ compressionLevel: 0 })
-        .toFile(panelPath);
-      logStep(orderId, "sharp.panel.saved", {
-        panelIndex: i + 1,
-        panelWidthPx,
-        panelPath,
-      });
-      assertTmpUsageSafe(orderId, `panel_saved_${i + 1}`);
-      panelFiles.push(panelPath);
-      offsetLeft += panelWidthPx;
-    }
-
     logStep(orderId, "sharp.crop.completed", {
       durationMs: Date.now() - t0,
       panelCount,
     });
 
-    try {
-      if (fs.existsSync(masterPath)) fs.unlinkSync(masterPath);
-      logStep(orderId, "tmp.cleanup.master_deleted", { masterPath });
-    } catch (cleanupErr) {
-      logStep(orderId, "tmp.cleanup.master_delete_failed", {
-        file: masterPath,
-        message: cleanupErr?.message || String(cleanupErr),
-      });
-    }
-    assertTmpUsageSafe(orderId, "after_master_delete");
+    const manifest = {
+      orderId: String(orderId),
+      masterPath,
+      safeCrop,
+      panelPxWidths,
+      panelCount,
+      panelWidthCm: Number(panelInfo.panelWidthCm.toFixed(4)),
+      createdAt: new Date().toISOString(),
+    };
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+    logStep(orderId, "manifest.created", {
+      manifestPath,
+      panelCount: manifest.panelCount,
+    });
 
     const downloadPath = `/download/${orderId}`;
     const downloadUrl = PUBLIC_BASE_URL
@@ -580,9 +563,11 @@ app.post("/webhooks/orders-paid", (req, res) => {
 app.get("/download/:orderId", (req, res) => {
   const { orderId } = req.params;
   const dir = path.join(BASE_DIR, orderId);
+  const xmlPath = path.join(dir, "order.xml");
+  const manifestPath = path.join(dir, "manifest.json");
   logStep(orderId, "download.requested", { dir });
 
-  if (!fs.existsSync(dir)) {
+  if (!fs.existsSync(dir) || !fs.existsSync(xmlPath) || !fs.existsSync(manifestPath)) {
     logStep(orderId, "download.not_found");
     return res.status(404).send("Order artifacts not found");
   }
@@ -600,16 +585,45 @@ app.get("/download/:orderId", (req, res) => {
   });
   archive.pipe(res);
 
-  logStep(orderId, "download.archive.start");
-  archive.file(path.join(dir, "order.xml"), { name: "order.xml" });
-  const panelFiles = fs
-    .readdirSync(dir)
-    .filter((name) => /^panel-\d+\.png$/.test(name))
-    .sort((a, b) => Number(a.match(/\d+/)?.[0] || 0) - Number(b.match(/\d+/)?.[0] || 0));
-  for (const fileName of panelFiles) {
-    archive.file(path.join(dir, fileName), { name: fileName });
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  } catch (err) {
+    logStep(orderId, "download.manifest.error", { message: err?.message || String(err) });
+    return res.status(500).send("manifest error");
   }
-  logStep(orderId, "download.archive.files", { count: panelFiles.length, files: panelFiles });
+
+  logStep(orderId, "download.archive.start");
+  archive.file(xmlPath, { name: "order.xml" });
+
+  let offsetLeft = 0;
+  for (let i = 0; i < (manifest.panelPxWidths || []).length; i++) {
+    const panelWidthPx = manifest.panelPxWidths[i];
+    const panelName = `panel-${i + 1}.png`;
+    const panelStream = sharp(manifest.masterPath, {
+      sequentialRead: true,
+      limitInputPixels: false,
+    })
+      .extract({
+        left: manifest.safeCrop.left + offsetLeft,
+        top: manifest.safeCrop.top,
+        width: panelWidthPx,
+        height: manifest.safeCrop.height,
+      })
+      .png({ compressionLevel: 0 });
+
+    archive.append(panelStream, { name: panelName });
+    logStep(orderId, "download.archive.panel_stream_added", {
+      panelIndex: i + 1,
+      panelWidthPx,
+      panelName,
+    });
+    offsetLeft += panelWidthPx;
+  }
+  logStep(orderId, "download.archive.files", {
+    count: (manifest.panelPxWidths || []).length,
+    hasXml: true,
+  });
   archive.finalize();
   logStep(orderId, "download.archive.finalized");
 
