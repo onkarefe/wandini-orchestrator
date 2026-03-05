@@ -12,12 +12,12 @@ sharp.cache(false);
 sharp.concurrency(1);
 
 const app = express();
-app.use(express.json({ limit: "20mb" }));
+app.use(express.json({ limit: "100mb" }));
 
 const PORT = process.env.PORT || 10000;
 const BASE_DIR = "/tmp/wandini";
 const MAX_PANEL_CM = 70;
-const PUBLIC_BASE_URL = "https://wandini-orchestrator.onrender.com";
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || null;
 const TMP_LIMIT_BYTES = 2 * 1024 * 1024 * 1024; // Render /tmp hard limit (2GB)
 const TMP_SAFETY_BYTES = 200 * 1024 * 1024; // Leave headroom to avoid eviction
 const ARTIFACT_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
@@ -134,7 +134,8 @@ function cleanupForBudget(orderId, requiredFreeBytes, excludeOrderId = null) {
   const removedDirs = [];
 
   for (const d of dirs) {
-    if (excludeOrderId !== null && String(d.entry) === String(excludeOrderId)) continue;
+    if (excludeOrderId !== null && String(d.entry) === String(excludeOrderId))
+      continue;
     if (freedBytes >= requiredFreeBytes) break;
     try {
       fs.rmSync(d.dirPath, { recursive: true, force: true });
@@ -248,7 +249,14 @@ function buildPanelPixelWidths(totalWidthPx, panelCount) {
   return widths;
 }
 
-function createSingleZipFromPlan(orderId, zipPath, xmlPath, masterPath, safeCrop, panelPxWidths) {
+function createSingleZipFromPlan(
+  orderId,
+  zipPath,
+  xmlPath,
+  masterPath,
+  safeCrop,
+  panelPxWidths,
+) {
   return new Promise((resolve, reject) => {
     const output = fs.createWriteStream(zipPath);
     const archive = archiver("zip", { zlib: { level: 9 } });
@@ -316,7 +324,11 @@ function downloadFile(url, dest) {
           reject(new Error(`Download failed: ${res.statusCode}`));
           return;
         }
-        console.log(`[download] started`, { url, statusCode: res.statusCode, dest });
+        console.log(`[download] started`, {
+          url,
+          statusCode: res.statusCode,
+          dest,
+        });
         res.pipe(file);
         file.on("finish", () => {
           file.close(() => {
@@ -441,7 +453,11 @@ async function processOrder(order) {
     logStep(orderId, "configurator.payload", {
       version: cfg?.version ?? null,
       masterAssetId,
-      output: { widthMm: outputWidthMm, heightMm: outputHeightMm, unit: cfg?.output?.unit },
+      output: {
+        widthMm: outputWidthMm,
+        heightMm: outputHeightMm,
+        unit: cfg?.output?.unit,
+      },
       cropRatio,
       panelCount: panelInfo.panelCount,
       panelWidthCm: Number(panelInfo.panelWidthCm.toFixed(4)),
@@ -492,12 +508,35 @@ async function processOrder(order) {
     const safeCrop = {
       left: Math.max(0, Math.min(crop.left, Math.max(0, meta.width - 1))),
       top: Math.max(0, Math.min(crop.top, Math.max(0, meta.height - 1))),
-      width: Math.max(1, Math.min(crop.width, Math.max(1, meta.width - Math.max(0, Math.min(crop.left, Math.max(0, meta.width - 1)))))),
-      height: Math.max(1, Math.min(crop.height, Math.max(1, meta.height - Math.max(0, Math.min(crop.top, Math.max(0, meta.height - 1)))))),
+      width: Math.max(
+        1,
+        Math.min(
+          crop.width,
+          Math.max(
+            1,
+            meta.width -
+              Math.max(0, Math.min(crop.left, Math.max(0, meta.width - 1))),
+          ),
+        ),
+      ),
+      height: Math.max(
+        1,
+        Math.min(
+          crop.height,
+          Math.max(
+            1,
+            meta.height -
+              Math.max(0, Math.min(crop.top, Math.max(0, meta.height - 1))),
+          ),
+        ),
+      ),
     };
     logStep(orderId, "sharp.crop.calculated", { requested: crop, safeCrop });
-    const masterSize = fs.existsSync(masterPath) ? fs.statSync(masterPath).size : 0;
-    const estimatedTotalNeedBytes = Math.ceil(masterSize * 1.25) + 150 * 1024 * 1024;
+    const masterSize = fs.existsSync(masterPath)
+      ? fs.statSync(masterPath).size
+      : 0;
+    const estimatedTotalNeedBytes =
+      Math.ceil(masterSize * 1.25) + 150 * 1024 * 1024;
     ensureTmpBudget(orderId, estimatedTotalNeedBytes);
 
     const panelCount = panelInfo.panelCount || 1;
@@ -516,13 +555,24 @@ async function processOrder(order) {
       panelCount,
     });
 
-    await createSingleZipFromPlan(orderId, zipPath, xmlPath, masterPath, safeCrop, panelPxWidths);
+    await createSingleZipFromPlan(
+      orderId,
+      zipPath,
+      xmlPath,
+      masterPath,
+      safeCrop,
+      panelPxWidths,
+    );
     assertTmpUsageSafe(orderId, "after_zip_create");
 
     try {
       if (fs.existsSync(masterPath)) fs.unlinkSync(masterPath);
       if (fs.existsSync(xmlPath)) fs.unlinkSync(xmlPath);
-      logStep(orderId, "tmp.cleanup.source_deleted", { masterPath, xmlPath, zipPath });
+      logStep(orderId, "tmp.cleanup.source_deleted", {
+        masterPath,
+        xmlPath,
+        zipPath,
+      });
     } catch (cleanupErr) {
       logStep(orderId, "tmp.cleanup.source_delete_failed", {
         message: cleanupErr?.message || String(cleanupErr),
@@ -565,7 +615,10 @@ async function processOrder(order) {
 
     if (queue.length > 0) {
       const next = queue.shift();
-      logStep(orderId, "queue.dequeue.next", { nextOrderId: next?.id, queueLengthNow: queue.length });
+      logStep(orderId, "queue.dequeue.next", {
+        nextOrderId: next?.id,
+        queueLengthNow: queue.length,
+      });
       processOrder(next);
     }
   }
@@ -591,7 +644,9 @@ app.post("/webhooks/orders-paid", (req, res) => {
   }
 
   if (isProcessing) {
-    logStep(orderId, "webhook.queued.worker_busy", { queueLengthBefore: queue.length });
+    logStep(orderId, "webhook.queued.worker_busy", {
+      queueLengthBefore: queue.length,
+    });
     queue.push(order);
     logStep(orderId, "webhook.queued", { queueLengthAfter: queue.length });
     return res.status(200).send("queued");
@@ -618,7 +673,9 @@ app.get("/download/:orderId", (req, res) => {
   logStep(orderId, "download.stream.start", { zipPath });
   res.download(zipPath, `wandini-${orderId}.zip`, (err) => {
     if (err) {
-      logStep(orderId, "download.stream.error", { message: err?.message || String(err) });
+      logStep(orderId, "download.stream.error", {
+        message: err?.message || String(err),
+      });
       return;
     }
     try {
